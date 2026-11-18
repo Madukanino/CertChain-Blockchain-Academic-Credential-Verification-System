@@ -54,10 +54,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         // Check active sessions
         safeGetSession()
-            .then(({ data: { session } }) => {
+            .then(async ({ data: { session } }) => {
                 const nextUser = (session?.user ?? null) as User | null;
                 setUser(nextUser);
-                resolveRole(nextUser);
+                await resolveRole(nextUser);
                 setLoading(false);
             })
             .catch(() => {
@@ -69,10 +69,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // Listen for auth changes
         const {
             data: { subscription },
-        } = supabase.auth.onAuthStateChange((_event, session) => {
+        } = supabase.auth.onAuthStateChange(async (_event, session) => {
             const nextUser = (session?.user ?? null) as User | null;
             setUser(nextUser);
-            resolveRole(nextUser);
+            await resolveRole(nextUser);
             setLoading(false);
         });
 
@@ -145,7 +145,7 @@ export function ProtectedRoute({
         }
     }, [user, loading, userRole, router, allowedRoles]);
 
-    if (loading) {
+    if (loading || userRole === 'loading') {
         return (
             <div className="min-h-screen bg-gray-50">
                 <nav className="sticky top-0 z-50 border-b border-gray-200 bg-white/90 shadow-sm backdrop-blur-lg">
