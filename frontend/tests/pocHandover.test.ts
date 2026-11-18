@@ -8,6 +8,14 @@ type MockDbState = {
     auditLogs: Array<Record<string, unknown>>;
     authUserEmail: string;
     profileRole: string;
+    /** Injected per-test to make specific operations fail. */
+    failOn: Partial<{
+        createUser: boolean;
+        profileUpsert: boolean;
+        membershipUpsert: boolean;
+        deactivateProfile: boolean;
+        linkGeneration: boolean;
+    }>;
 };
 
 const state: MockDbState = {
@@ -36,6 +44,7 @@ const state: MockDbState = {
     auditLogs: [],
     authUserEmail: 'admin@example.com',
     profileRole: 'admin',
+    failOn: {},
 };
 
 vi.mock('@supabase/supabase-js', () => ({
@@ -55,13 +64,13 @@ vi.mock('@supabase/supabase-js', () => ({
             auth: {
                 admin: {
                     getUserById: vi.fn(async () => ({
-                        // `requireAdminRequest` forwards this whole user object
-                        // into `resolveUserRole`, which looks up
-                        // profiles.id — so `id` must be present, not just email.
                         data: { user: { id: 'admin-user-id', email: state.authUserEmail } },
                         error: null,
                     })),
                     createUser: vi.fn(async ({ email, user_metadata }: { email: string; user_metadata?: { name?: string } }) => {
+                        if (state.failOn.createUser) {
+                            return { data: null, error: { message: 'Internal server error' } };
+                        }
                         const newId = `user-${email.split('@')[0]}`;
                         return {
                             data: {
@@ -78,14 +87,19 @@ vi.mock('@supabase/supabase-js', () => ({
                         data: { users: [] },
                         error: null,
                     })),
-                    generateLink: vi.fn(async ({ type, email: _email }: { type: string; email: string }) => ({
-                        data: {
-                            properties: {
-                                action_link: `https://example.supabase.co/auth/v1/verify?token=mock-${type}-token&type=${type}&redirect_to=http://localhost:3000/auth/reset-password`,
+                    generateLink: vi.fn(async ({ type, email: _email }: { type: string; email: string }) => {
+                        if (state.failOn.linkGeneration) {
+                            return { data: null, error: { message: 'Link generation failed' } };
+                        }
+                        return {
+                            data: {
+                                properties: {
+                                    action_link: `https://example.supabase.co/auth/v1/verify?token=mock-${type}-token&type=${type}&redirect_to=http://localhost:3000/auth/reset-password`,
+                                },
                             },
-                        },
-                        error: null,
-                    })),
+                            error: null,
+                        };
+                    }),
                 },
             },
             from: vi.fn((tableName: string) => ({
@@ -111,6 +125,12 @@ vi.mock('@supabase/supabase-js', () => ({
                 update: vi.fn((updates: Record<string, unknown>) => ({
                     eq: vi.fn((col1: string, val1: string) => {
                         if (tableName === 'profiles' && col1 === 'id') {
+                            if (state.failOn.deactivateProfile) {
+                                return {
+                                    then: (resolve: (arg: unknown) => unknown) =>
+                                        resolve({ error: { message: 'DB error' } }),
+                                };
+                            }
                             if (state.profiles[val1]) {
                                 Object.assign(state.profiles[val1], updates);
                             }
@@ -138,6 +158,9 @@ vi.mock('@supabase/supabase-js', () => ({
                 })),
                 upsert: vi.fn(async (data: Record<string, unknown>) => {
                     if (tableName === 'profiles') {
+                        if (state.failOn.profileUpsert) {
+                            return { error: { message: 'Profile upsert failed' } };
+                        }
                         const id = data.id as string;
                         state.profiles[id] = {
                             id,
@@ -149,6 +172,9 @@ vi.mock('@supabase/supabase-js', () => ({
                         };
                     }
                     if (tableName === 'institution_users') {
+                        if (state.failOn.membershipUpsert) {
+                            return { error: { message: 'Membership upsert failed' } };
+                        }
                         state.institutionUsers.push(data as unknown as MockDbState['institutionUsers'][0]);
                     }
                     return { error: null };
@@ -194,6 +220,7 @@ describe('POST /api/admin/institutions/[id]/poc-handover', () => {
             },
         ];
         state.auditLogs = [];
+        state.failOn = {};
     });
 
     it('successfully completes POC handover, deactivates old POC, provisions new POC and logs audit record', async () => {
@@ -243,6 +270,9 @@ describe('POST /api/admin/institutions/[id]/poc-handover', () => {
             new_poc_email: 'alistair.finch@oxford.edu',
             requester_email: 'registrar@oxford.edu',
         });
+
+        // Accurate deactivation state in response
+        expect(json.previousPoc.deactivated).toBe(true);
     });
 
     it('rejects handover without required fields', async () => {
@@ -272,5 +302,201 @@ describe('POST /api/admin/institutions/[id]/poc-handover', () => {
         expect(response.status).toBe(400);
         const json = await response.json();
         expect(json.success).toBe(false);
+    });
+
+    it('leaves the old POC active when new user creation fails', async () => {
+        state.failOn.createUser = true;
+
+        const { POST } = await import(
+            '../src/app/api/admin/institutions/[id]/poc-handover/route'
+        );
+
+        const request = new NextRequest(
+            'http://localhost:3000/api/admin/institutions/11111111-1111-4111-a111-111111111111/poc-handover',
+            {
+                method: 'POST',
+                headers: new Headers({
+                    authorization: 'Bearer valid-admin-token',
+                    'content-type': 'application/json',
+                }),
+                body: JSON.stringify({
+                    newPocName: 'Jane New',
+                    newPocEmail: 'jane.new@oxford.edu',
+                    requesterEmail: 'registrar@oxford.edu',
+                    verificationMethod: 'Video call identity check',
+                }),
+            },
+        );
+
+        const response = await POST(request, {
+            params: Promise.resolve({ id: '11111111-1111-4111-a111-111111111111' }),
+        });
+
+        expect(response.status).toBe(500);
+        const json = await response.json();
+        expect(json.success).toBe(false);
+
+        // Old POC must remain active — institution is not left without a POC.
+        expect(state.profiles['user-old-poc'].is_active).toBe(true);
+    });
+
+    it('leaves the old POC active when new POC profile upsert fails', async () => {
+        state.failOn.profileUpsert = true;
+
+        const { POST } = await import(
+            '../src/app/api/admin/institutions/[id]/poc-handover/route'
+        );
+
+        const request = new NextRequest(
+            'http://localhost:3000/api/admin/institutions/11111111-1111-4111-a111-111111111111/poc-handover',
+            {
+                method: 'POST',
+                headers: new Headers({
+                    authorization: 'Bearer valid-admin-token',
+                    'content-type': 'application/json',
+                }),
+                body: JSON.stringify({
+                    newPocName: 'Jane New',
+                    newPocEmail: 'jane.new@oxford.edu',
+                    requesterEmail: 'registrar@oxford.edu',
+                    verificationMethod: 'Video call identity check',
+                }),
+            },
+        );
+
+        const response = await POST(request, {
+            params: Promise.resolve({ id: '11111111-1111-4111-a111-111111111111' }),
+        });
+
+        expect(response.status).toBe(500);
+        const json = await response.json();
+        expect(json.success).toBe(false);
+
+        // Old POC was not deactivated because new POC was not fully provisioned.
+        expect(state.profiles['user-old-poc'].is_active).toBe(true);
+    });
+
+    it('reports partial success accurately when membership upsert fails', async () => {
+        state.failOn.membershipUpsert = true;
+
+        const { POST } = await import(
+            '../src/app/api/admin/institutions/[id]/poc-handover/route'
+        );
+
+        const request = new NextRequest(
+            'http://localhost:3000/api/admin/institutions/11111111-1111-4111-a111-111111111111/poc-handover',
+            {
+                method: 'POST',
+                headers: new Headers({
+                    authorization: 'Bearer valid-admin-token',
+                    'content-type': 'application/json',
+                }),
+                body: JSON.stringify({
+                    newPocName: 'Jane New',
+                    newPocEmail: 'jane.new@oxford.edu',
+                    requesterEmail: 'registrar@oxford.edu',
+                    verificationMethod: 'Video call identity check',
+                }),
+            },
+        );
+
+        const response = await POST(request, {
+            params: Promise.resolve({ id: '11111111-1111-4111-a111-111111111111' }),
+        });
+
+        expect(response.status).toBe(500);
+        const json = await response.json();
+        expect(json.success).toBe(false);
+        // Response must describe what did and did not succeed.
+        expect(json.partial).toMatchObject({
+            institutionUpdated: true,
+            newPocProvisioned: true,
+            membershipRecorded: false,
+        });
+    });
+
+    it('reflects accurate deactivation state when old POC deactivation fails', async () => {
+        state.failOn.deactivateProfile = true;
+
+        const { POST } = await import(
+            '../src/app/api/admin/institutions/[id]/poc-handover/route'
+        );
+
+        const request = new NextRequest(
+            'http://localhost:3000/api/admin/institutions/11111111-1111-4111-a111-111111111111/poc-handover',
+            {
+                method: 'POST',
+                headers: new Headers({
+                    authorization: 'Bearer valid-admin-token',
+                    'content-type': 'application/json',
+                }),
+                body: JSON.stringify({
+                    newPocName: 'Dr. Alistair Finch',
+                    newPocEmail: 'alistair.finch@oxford.edu',
+                    requesterEmail: 'registrar@oxford.edu',
+                    verificationMethod: 'Official registrar letter on university letterhead',
+                }),
+            },
+        );
+
+        const response = await POST(request, {
+            params: Promise.resolve({ id: '11111111-1111-4111-a111-111111111111' }),
+        });
+
+        // Handover still succeeds — new POC is live.
+        expect(response.status).toBe(200);
+        const json = await response.json();
+        expect(json.success).toBe(true);
+
+        // Response must accurately report that old POC was NOT deactivated.
+        expect(json.previousPoc.deactivated).toBe(false);
+        expect(json.message).toContain('deactivate it manually');
+
+        // Audit log captures the actual state.
+        expect(state.auditLogs.length).toBe(1);
+        const details = state.auditLogs[0].details as Record<string, unknown>;
+        expect(details.oldAccountDeactivated).toBe(false);
+
+        // Institution is still updated with the new POC.
+        expect(state.institution?.email).toBe('alistair.finch@oxford.edu');
+    });
+
+    it('succeeds and reports inviteLinkGenerated=false when link generation fails', async () => {
+        state.failOn.linkGeneration = true;
+
+        const { POST } = await import(
+            '../src/app/api/admin/institutions/[id]/poc-handover/route'
+        );
+
+        const request = new NextRequest(
+            'http://localhost:3000/api/admin/institutions/11111111-1111-4111-a111-111111111111/poc-handover',
+            {
+                method: 'POST',
+                headers: new Headers({
+                    authorization: 'Bearer valid-admin-token',
+                    'content-type': 'application/json',
+                }),
+                body: JSON.stringify({
+                    newPocName: 'Dr. Alistair Finch',
+                    newPocEmail: 'alistair.finch@oxford.edu',
+                    requesterEmail: 'registrar@oxford.edu',
+                    verificationMethod: 'Official registrar letter on university letterhead',
+                }),
+            },
+        );
+
+        const response = await POST(request, {
+            params: Promise.resolve({ id: '11111111-1111-4111-a111-111111111111' }),
+        });
+
+        // Link failure is non-fatal — handover still completes.
+        expect(response.status).toBe(200);
+        const json = await response.json();
+        expect(json.success).toBe(true);
+        expect(json.inviteLink).toBeNull();
+        expect(json.inviteLinkGenerated).toBe(false);
+
+        // Old POC was still deactivated — handover did not stop at link failure.
+        expect(state.profiles['user-old-poc'].is_active).toBe(false);
     });
 });

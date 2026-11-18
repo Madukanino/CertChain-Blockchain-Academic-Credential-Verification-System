@@ -29,12 +29,18 @@ const handoverSchema = z.object({
 /**
  * First-class POC Handover procedure for institutional turnover.
  *
- * Implements:
- * 1. Verification record & defense (identity-verification step audit).
- * 2. Deactivation of previous POC account (preserves audit trail, never deleted).
- * 3. Association of institution with new POC.
- * 4. Automatic generation of fresh single-use invite/recovery link for the new POC.
- * 5. Full audit logging with actor admin ID, requester, previous POC, and new POC.
+ * Step order (fix for issue #161 — provision FIRST, deactivate LAST):
+ * 1. Fetch and validate the target institution.
+ * 2. Provision new POC auth user (create or locate existing).
+ * 3. Upsert new POC profile as active institution role.
+ * 4. Update institution record to point to new POC.
+ * 5. Record new POC in institution_users as active owner.
+ * 6. Generate fresh single-use invite/recovery link for the new POC.
+ * 7. Deactivate the old POC profile and membership (final step — only
+ *    reached if all prior steps succeeded, leaving old POC active on
+ *    any earlier failure).
+ * 8. Full audit log with actor, requester, previous and new POC, and
+ *    accurate partial-success flags.
  */
 export async function POST(
     request: NextRequest,
@@ -113,7 +119,171 @@ export async function POST(
         const oldAuthUserId = institution.auth_user_id;
         const oldPocEmail = institution.email;
 
-        // 2. Deactivate old POC (never delete)
+        // 2. Provision or locate new POC user in Supabase Auth.
+        //    Done BEFORE touching the old POC so a failure here leaves the
+        //    institution with a live POC rather than none.
+        let newAuthUserId: string | null = null;
+
+        const { data: createdUser, error: createUserError } =
+            await supabase.auth.admin.createUser({
+                email: newPocEmail,
+                email_confirm: true,
+                user_metadata: {
+                    name: newPocName,
+                    role: 'institution',
+                },
+            });
+
+        if (createUserError) {
+            // User already exists in auth — locate the existing record.
+            if (createUserError.message.toLowerCase().includes('already')) {
+                const { data: listData, error: listError } =
+                    await supabase.auth.admin.listUsers({ perPage: 1000 });
+                if (!listError && listData?.users) {
+                    const existing = listData.users.find(
+                        (u) => u.email?.toLowerCase() === newPocEmail.toLowerCase(),
+                    );
+                    if (existing) {
+                        newAuthUserId = existing.id;
+                    }
+                }
+            }
+
+            if (!newAuthUserId) {
+                structuredLog('ERROR', 'Failed to create new POC user account', requestId, {
+                    error: createUserError,
+                    newPocEmail,
+                });
+                // Old POC is still active — institution is not left without a POC.
+                return NextResponse.json(
+                    {
+                        success: false,
+                        error: `Failed to provision new POC user: ${createUserError.message}`,
+                    },
+                    { status: 500 },
+                );
+            }
+        } else if (createdUser.user) {
+            newAuthUserId = createdUser.user.id;
+        }
+
+        if (!newAuthUserId) {
+            return NextResponse.json(
+                { success: false, error: 'Could not resolve new POC user identifier' },
+                { status: 500 },
+            );
+        }
+
+        // 3. Ensure profile is provisioned as active institution role.
+        const { error: profileUpsertError } = await supabase.from('profiles').upsert(
+            {
+                id: newAuthUserId,
+                email: newPocEmail,
+                role: 'institution',
+                full_name: newPocName,
+                is_active: true,
+                deactivated_at: null,
+                deactivated_reason: null,
+            },
+            { onConflict: 'id' },
+        );
+
+        if (profileUpsertError) {
+            structuredLog('ERROR', 'Failed to upsert new POC profile', requestId, {
+                error: profileUpsertError,
+                newAuthUserId,
+            });
+            // New user exists in auth but profile is broken — report failure
+            // while old POC is still active.
+            return NextResponse.json(
+                { success: false, error: 'Failed to provision new POC profile' },
+                { status: 500 },
+            );
+        }
+
+        // 4. Update institution record to point at the new POC.
+        const { error: institutionUpdateError } = await supabase
+            .from('institutions')
+            .update({
+                auth_user_id: newAuthUserId,
+                email: newPocEmail,
+            })
+            .eq('id', institution.id);
+
+        if (institutionUpdateError) {
+            structuredLog('ERROR', 'Failed to update institution POC', requestId, {
+                error: institutionUpdateError,
+                institutionId: institution.id,
+            });
+            return NextResponse.json(
+                { success: false, error: 'Failed to update institution POC' },
+                { status: 500 },
+            );
+        }
+
+        // 5. Record new POC in institution_users as active owner.
+        const { error: membershipUpsertError } = await supabase.from('institution_users').upsert(
+            {
+                institution_id: institution.id,
+                auth_user_id: newAuthUserId,
+                role: 'owner',
+                status: 'active',
+                invited_by: adminCheck.userId,
+            },
+            { onConflict: 'institution_id,auth_user_id' },
+        );
+
+        if (membershipUpsertError) {
+            structuredLog('ERROR', 'Failed to record new POC membership', requestId, {
+                error: membershipUpsertError,
+                institutionId: institution.id,
+                newAuthUserId,
+            });
+            // Institution row already points at the new POC (step 4 succeeded),
+            // but the membership record is missing. Report as failure with context.
+            return NextResponse.json(
+                {
+                    success: false,
+                    error: 'Failed to record new POC membership',
+                    partial: {
+                        institutionUpdated: true,
+                        newPocProvisioned: true,
+                        membershipRecorded: false,
+                    },
+                },
+                { status: 500 },
+            );
+        }
+
+        // 6. Generate direct recovery / access link for the new POC.
+        const origin = request.nextUrl.origin || 'http://localhost:3000';
+        const redirectTo = `${origin}/auth/reset-password?next=/dashboard`;
+
+        const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
+            type: 'recovery',
+            email: newPocEmail,
+            options: {
+                redirectTo,
+            },
+        });
+
+        const actionLink = linkData?.properties?.action_link || null;
+
+        if (linkError) {
+            structuredLog('WARN', 'Could not generate recovery link for new POC', requestId, {
+                error: linkError,
+                newPocEmail,
+            });
+            // Link generation failure is non-fatal — the new POC can recover
+            // via the standard password-reset flow. Continue to deactivate the
+            // old POC so the handover is not left in a half-finished state.
+        }
+
+        // 7. Deactivate old POC — final step, only reached after the new POC is
+        //    fully provisioned. A failure here is logged but does not undo the
+        //    new-POC setup; the response reflects the actual deactivation state.
+        let oldPocDeactivated = false;
+
         if (oldAuthUserId) {
             const { error: deactivateProfileError } = await supabase
                 .from('profiles')
@@ -134,9 +304,11 @@ export async function POST(
                         oldAuthUserId,
                     },
                 );
+            } else {
+                oldPocDeactivated = true;
             }
 
-            // Also mark as inactive in institution_users
+            // Also mark membership as inactive; best-effort.
             await supabase
                 .from('institution_users')
                 .update({ status: 'deactivated' })
@@ -144,135 +316,7 @@ export async function POST(
                 .eq('auth_user_id', oldAuthUserId);
         }
 
-        // 3. Provision or locate new POC user in Supabase Auth
-        let newAuthUserId: string | null = null;
-
-        // Try creating new user first
-        const { data: createdUser, error: createUserError } =
-            await supabase.auth.admin.createUser({
-                email: newPocEmail,
-                email_confirm: true,
-                user_metadata: {
-                    name: newPocName,
-                    role: 'institution',
-                },
-            });
-
-        if (createUserError) {
-            // If user already exists in auth, retrieve existing user ID
-            if (createUserError.message.toLowerCase().includes('already')) {
-                // List users to locate existing user ID
-                const { data: listData, error: listError } =
-                    await supabase.auth.admin.listUsers({ perPage: 1000 });
-                if (!listError && listData?.users) {
-                    const existing = listData.users.find(
-                        (u) => u.email?.toLowerCase() === newPocEmail.toLowerCase(),
-                    );
-                    if (existing) {
-                        newAuthUserId = existing.id;
-                    }
-                }
-            }
-
-            if (!newAuthUserId) {
-                structuredLog('ERROR', 'Failed to create new POC user account', requestId, {
-                    error: createUserError,
-                    newPocEmail,
-                });
-                return NextResponse.json(
-                    {
-                        success: false,
-                        error: `Failed to provision new POC user: ${createUserError.message}`,
-                    },
-                    { status: 500 },
-                );
-            }
-        } else if (createdUser.user) {
-            newAuthUserId = createdUser.user.id;
-        }
-
-        if (!newAuthUserId) {
-            return NextResponse.json(
-                { success: false, error: 'Could not resolve new POC user identifier' },
-                { status: 500 },
-            );
-        }
-
-        // 4. Ensure profile is provisioned as active institution role
-        const { error: profileUpsertError } = await supabase.from('profiles').upsert(
-            {
-                id: newAuthUserId,
-                email: newPocEmail,
-                role: 'institution',
-                full_name: newPocName,
-                is_active: true,
-                deactivated_at: null,
-                deactivated_reason: null,
-            },
-            { onConflict: 'id' },
-        );
-
-        if (profileUpsertError) {
-            structuredLog('WARN', 'Failed to upsert new POC profile', requestId, {
-                error: profileUpsertError,
-                newAuthUserId,
-            });
-        }
-
-        // 5. Update institution record
-        const { error: institutionUpdateError } = await supabase
-            .from('institutions')
-            .update({
-                auth_user_id: newAuthUserId,
-                email: newPocEmail,
-            })
-            .eq('id', institution.id);
-
-        if (institutionUpdateError) {
-            structuredLog('ERROR', 'Failed to update institution POC', requestId, {
-                error: institutionUpdateError,
-                institutionId: institution.id,
-            });
-            return NextResponse.json(
-                { success: false, error: 'Failed to update institution POC' },
-                { status: 500 },
-            );
-        }
-
-        // 6. Record in institution_users
-        await supabase.from('institution_users').upsert(
-            {
-                institution_id: institution.id,
-                auth_user_id: newAuthUserId,
-                role: 'owner',
-                status: 'active',
-                invited_by: adminCheck.userId,
-            },
-            { onConflict: 'institution_id,auth_user_id' },
-        );
-
-        // 7. Generate direct recovery / access link for the new POC
-        const origin = request.nextUrl.origin || 'http://localhost:3000';
-        const redirectTo = `${origin}/auth/reset-password?next=/dashboard`;
-
-        const { data: linkData, error: linkError } = await supabase.auth.admin.generateLink({
-            type: 'recovery',
-            email: newPocEmail,
-            options: {
-                redirectTo,
-            },
-        });
-
-        const actionLink = linkData?.properties?.action_link || null;
-
-        if (linkError) {
-            structuredLog('WARN', 'Could not generate recovery link for new POC', requestId, {
-                error: linkError,
-                newPocEmail,
-            });
-        }
-
-        // 8. Record audit log
+        // 8. Record audit log.
         const { error: auditError } = await supabase.from('admin_audit_logs').insert({
             action: 'poc_handover',
             actor_admin_id: adminCheck.userId,
@@ -287,7 +331,7 @@ export async function POST(
                 verificationMethod,
                 notes: notes || null,
                 actionLinkGenerated: Boolean(actionLink),
-                oldAccountDeactivated: Boolean(oldAuthUserId),
+                oldAccountDeactivated: oldPocDeactivated,
             },
         });
 
@@ -303,13 +347,17 @@ export async function POST(
             newPoc: newPocEmail,
             adminId: adminCheck.userId,
             requesterEmail,
+            oldPocDeactivated,
+            inviteLinkGenerated: Boolean(actionLink),
         });
 
         return NextResponse.json({
             success: true,
-            message:
-                'POC handover completed successfully. Previous POC account was deactivated and fresh access credentials generated.',
+            message: oldPocDeactivated
+                ? 'POC handover completed successfully. Previous POC account was deactivated and fresh access credentials generated.'
+                : 'POC handover completed. New POC is active. Previous POC account deactivation failed — please deactivate it manually.',
             inviteLink: actionLink,
+            inviteLinkGenerated: Boolean(actionLink),
             institution: {
                 id: institution.id,
                 name: institution.name,
@@ -317,7 +365,7 @@ export async function POST(
             },
             previousPoc: {
                 email: oldPocEmail,
-                deactivated: true,
+                deactivated: oldPocDeactivated,
             },
         });
     } catch (error) {
