@@ -39,7 +39,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        const { walletAddress } = await request.json();
+        const { walletAddress, confirmed } = await request.json();
         const normalizedWallet =
             typeof walletAddress === 'string' ? walletAddress.trim() : '';
 
@@ -53,6 +53,14 @@ export async function POST(request: NextRequest) {
         if (!StrKey.isValidEd25519PublicKey(normalizedWallet)) {
             return NextResponse.json(
                 { success: false, error: 'Wallet address must be a valid Stellar public key' },
+                { status: 400 },
+            );
+        }
+
+        // Require explicit user confirmation to prevent silent wallet swaps.
+        if (!confirmed) {
+            return NextResponse.json(
+                { success: false, error: 'Explicit confirmation is required to link a new wallet' },
                 { status: 400 },
             );
         }
@@ -126,6 +134,26 @@ export async function POST(request: NextRequest) {
                 { success: false, error: 'Failed to link institution wallet' },
                 { status: 500 },
             );
+        }
+
+        // Record who linked the wallet, what it replaced, and when — linking
+        // resets verification so this change warrants a durable audit trail.
+        const { error: auditError } = await supabase.from('admin_audit_logs').insert({
+            action: 'link_institution_wallet',
+            actor_admin_id: authCheck.userId,
+            target_institution_id: institution.id,
+            details: {
+                previousWalletAddress: institution.wallet_address ?? null,
+                newWalletAddress: normalizedWallet,
+                verificationReset: true,
+            },
+        });
+
+        if (auditError) {
+            structuredLog('WARN', 'Failed to record wallet-link audit event', requestId, {
+                error: auditError,
+                institutionId: institution.id,
+            });
         }
 
         return NextResponse.json({

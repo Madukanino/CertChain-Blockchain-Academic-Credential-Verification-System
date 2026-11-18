@@ -6,6 +6,7 @@ import {
     InfoField,
     InstitutionProfileSkeleton,
     InstitutionUnavailableCard,
+    WalletLinkConfirmCard,
     WalletPromptCard,
     WalletStatus,
 } from '@/components/console/ConsoleCards';
@@ -59,6 +60,15 @@ export function InstitutionOverview() {
 
             {!profile.address && (
                 <WalletPromptCard message="Connect your wallet to issue credentials on the blockchain — use the “Connect Wallet” button in the sidebar." />
+            )}
+
+            {profile.pendingWalletAddress && (
+                <WalletLinkConfirmCard
+                    pendingAddress={profile.pendingWalletAddress}
+                    onConfirm={profile.confirmLinkWallet}
+                    onDismiss={profile.dismissPendingWallet}
+                    linking={profile.linkingWallet}
+                />
             )}
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

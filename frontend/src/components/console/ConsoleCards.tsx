@@ -1,9 +1,66 @@
 'use client';
 
 import type { ReactNode } from 'react';
-import { AlertCircle, Shield, Wallet } from 'lucide-react';
+import { AlertCircle, AlertTriangle, Shield, Wallet } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
+
+/**
+ * Shown when a connected wallet differs from the persisted institution wallet.
+ * The user must explicitly confirm before the change is written.
+ */
+export function WalletLinkConfirmCard({
+    pendingAddress,
+    onConfirm,
+    onDismiss,
+    linking,
+}: {
+    pendingAddress: string;
+    onConfirm: () => void;
+    onDismiss: () => void;
+    linking: boolean;
+}) {
+    return (
+        <Card className="border-destructive/25 bg-destructive/8 p-6">
+            <div className="flex items-start gap-3">
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-destructive/15 text-destructive">
+                    <AlertTriangle className="h-5 w-5" />
+                </span>
+                <div className="min-w-0 flex-1">
+                    <h3 className="text-base font-semibold text-foreground">
+                        Link new wallet to your institution?
+                    </h3>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                        Linking{' '}
+                        <span className="font-mono">
+                            {pendingAddress.slice(0, 6)}…{pendingAddress.slice(-4)}
+                        </span>{' '}
+                        will reset your institution&apos;s verification status to{' '}
+                        <strong>pending</strong> and clear its on-chain authorization record. An
+                        administrator will need to re-approve your institution before you can issue
+                        credentials.
+                    </p>
+                    <div className="mt-4 flex gap-3">
+                        <button
+                            onClick={onConfirm}
+                            disabled={linking}
+                            className="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+                        >
+                            {linking ? 'Linking…' : 'Yes, link this wallet'}
+                        </button>
+                        <button
+                            onClick={onDismiss}
+                            disabled={linking}
+                            className="rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted disabled:opacity-50"
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </Card>
+    );
+}
 
 /** Label / value pair used by the account-information cards. */
 export function InfoField({ label, children }: { label: string; children: ReactNode }) {

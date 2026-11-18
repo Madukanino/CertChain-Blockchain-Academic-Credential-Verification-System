@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { captureException, debugLog, debugWarn } from '@/lib/debug';
 import { safeGetSession, supabase } from '@/lib/supabase';
@@ -22,6 +22,21 @@ export interface InstitutionProfile {
     address: string | null;
     loading: boolean;
     linkingWallet: boolean;
+    /**
+     * When a connected wallet differs from the linked one, this holds the new
+     * address waiting for explicit user confirmation. `null` means no pending
+     * change (either wallets already match or no wallet is connected).
+     */
+    pendingWalletAddress: string | null;
+    /**
+     * Call this after the user confirms the wallet-link dialog. Sends the POST
+     * and clears `pendingWalletAddress` on success.
+     */
+    confirmLinkWallet: () => Promise<void>;
+    /**
+     * Call this to dismiss the confirmation prompt without linking.
+     */
+    dismissPendingWallet: () => void;
     /**
      * True when the signed-in user has an institution role but no institution
      * record. Since Issue #239 this is a provisioning error to surface, not a
@@ -51,7 +66,7 @@ export function useInstitutionProfile(): InstitutionProfile {
     const [loadingInstitution, setLoadingInstitution] = useState(true);
     const [unlinked, setUnlinked] = useState(false);
     const [linkingInstitutionWallet, setLinkingInstitutionWallet] = useState(false);
-    const walletLinkInFlight = useRef<string | null>(null);
+    const [pendingWalletAddress, setPendingWalletAddress] = useState<string | null>(null);
 
     useEffect(() => {
         const fetchInstitutionId = async () => {
@@ -109,69 +124,67 @@ export function useInstitutionProfile(): InstitutionProfile {
         fetchInstitutionId();
     }, [user, userRole]);
 
+    // Detect when a newly-connected wallet differs from the persisted one and
+    // surface it as `pendingWalletAddress` for the user to explicitly confirm.
+    // No mutation happens here — connecting a wallet is now read-only.
     useEffect(() => {
-        const linkConnectedWallet = async () => {
-            if (!user?.id || userRole !== 'institution' || !institutionId || !address) {
-                return;
-            }
+        if (!user?.id || userRole !== 'institution' || !institutionId || !address) {
+            setPendingWalletAddress(null);
+            return;
+        }
 
-            if (institutionWalletAddress?.toLowerCase() === address.toLowerCase()) {
-                return;
-            }
+        if (institutionWalletAddress?.toLowerCase() === address.toLowerCase()) {
+            setPendingWalletAddress(null);
+            return;
+        }
 
-            if (walletLinkInFlight.current === address) {
-                return;
-            }
-
-            walletLinkInFlight.current = address;
-            setLinkingInstitutionWallet(true);
-
-            try {
-                const {
-                    data: { session },
-                    error: sessionError,
-                } = await safeGetSession();
-
-                if (sessionError || !session?.access_token) {
-                    throw new Error('Your session expired. Please sign in again.');
-                }
-
-                const response = await fetch('/api/institution/link-wallet', {
-                    method: 'POST',
-                    headers: {
-                        Authorization: `Bearer ${session.access_token}`,
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ walletAddress: address }),
-                });
-                const payload = await response.json();
-
-                if (!response.ok || !payload?.success) {
-                    throw new Error(payload?.error || 'Failed to link institution wallet');
-                }
-
-                // Always sync local state with the persisted wallet address so
-                // the mismatch guard does not keep re-triggering on re-renders,
-                // regardless of whether the DB row actually changed.
-                setInstitutionWalletAddress(payload.walletAddress ?? address);
-                debugLog('Connected wallet linked to institution profile.');
-                if (payload.changed) {
-                    toast.success('Institution wallet linked');
-                }
-            } catch (error) {
-                captureException(error, { context: 'linkConnectedWallet' });
-                toast.error('Failed to link connected wallet to your institution');
-            } finally {
-                // Always clear the in-flight guard so a failed or interrupted
-                // attempt never permanently blocks future link attempts
-                // (e.g. after React StrictMode double-invocation or a transient error).
-                walletLinkInFlight.current = null;
-                setLinkingInstitutionWallet(false);
-            }
-        };
-
-        linkConnectedWallet();
+        setPendingWalletAddress(address);
     }, [address, institutionId, institutionWalletAddress, user?.id, userRole]);
+
+    const confirmLinkWallet = async () => {
+        if (!pendingWalletAddress || !institutionId) return;
+
+        setLinkingInstitutionWallet(true);
+
+        try {
+            const {
+                data: { session },
+                error: sessionError,
+            } = await safeGetSession();
+
+            if (sessionError || !session?.access_token) {
+                throw new Error('Your session expired. Please sign in again.');
+            }
+
+            const response = await fetch('/api/institution/link-wallet', {
+                method: 'POST',
+                headers: {
+                    Authorization: `Bearer ${session.access_token}`,
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ walletAddress: pendingWalletAddress, confirmed: true }),
+            });
+            const payload = await response.json();
+
+            if (!response.ok || !payload?.success) {
+                throw new Error(payload?.error || 'Failed to link institution wallet');
+            }
+
+            setInstitutionWalletAddress(payload.walletAddress ?? pendingWalletAddress);
+            setPendingWalletAddress(null);
+            debugLog('Connected wallet linked to institution profile.');
+            if (payload.changed) {
+                toast.success('Institution wallet linked');
+            }
+        } catch (error) {
+            captureException(error, { context: 'confirmLinkWallet' });
+            toast.error('Failed to link connected wallet to your institution');
+        } finally {
+            setLinkingInstitutionWallet(false);
+        }
+    };
+
+    const dismissPendingWallet = () => setPendingWalletAddress(null);
 
     return {
         institutionId,
@@ -182,6 +195,9 @@ export function useInstitutionProfile(): InstitutionProfile {
         address,
         loading: loadingInstitution,
         linkingWallet: linkingInstitutionWallet,
+        pendingWalletAddress,
+        confirmLinkWallet,
+        dismissPendingWallet,
         unlinked,
     };
 }
