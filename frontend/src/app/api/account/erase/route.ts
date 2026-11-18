@@ -218,6 +218,15 @@ export async function POST(request: NextRequest) {
             // Don't return an error to the user — their data is already gone.
         }
 
+        // Mark the erasure request completed now that all deletion steps have run.
+        // We do this after auth deletion (even if that step soft-failed) because
+        // the PII scrub in step 4 is the legally significant action; auth cleanup
+        // is a best-effort housekeeping step.
+        await serviceClient
+            .from('erasure_requests')
+            .update({ status: 'completed', completed_at: new Date().toISOString() })
+            .eq('id', erasureRequestId);
+
         return new NextResponse(null, { status: 204 });
     } catch (error: unknown) {
         captureException(error, { requestId, context: 'POST /api/account/erase' });

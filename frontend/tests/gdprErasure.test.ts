@@ -123,6 +123,11 @@ vi.mock('@/lib/debug', () => ({
     captureException: vi.fn(),
 }));
 
+vi.mock('@/lib/rateLimit', () => ({
+    enforceRateLimit: vi.fn().mockResolvedValue(null),
+    resetRateLimitStore: vi.fn(),
+}));
+
 describe('POST /api/account/erase — route handler', async () => {
     // Import the mocked modules so we can configure them per-test.
     const { requireAuthenticatedRequest, getServiceRoleClient } = await import('@/lib/serverAuth');
@@ -149,10 +154,13 @@ describe('POST /api/account/erase — route handler', async () => {
         expect(body.error).toContain('access token');
     });
 
-    it('returns 204 when erasure completes successfully', async () => {
+    it('returns 204 and marks the erasure row completed on full success', async () => {
         const mockErasureRow = { id: 'erasure-uuid' };
         const mockStudent = { id: 'student-uuid' };
         const mockCreds = [{ ipfs_hash: 'Qm123' }, { ipfs_hash: 'Qm456' }];
+
+        // Track updates made to erasure_requests so we can assert on them.
+        const erasureUpdates: Array<Record<string, unknown>> = [];
 
         vi.mocked(requireAuthenticatedRequest).mockResolvedValue({
             ok: true,
@@ -170,7 +178,10 @@ describe('POST /api/account/erase — route handler', async () => {
                         insert: vi.fn().mockReturnThis(),
                         select: vi.fn().mockReturnThis(),
                         single: vi.fn().mockResolvedValue({ data: mockErasureRow, error: null }),
-                        update: vi.fn().mockReturnThis(),
+                        update: vi.fn().mockImplementation((fields: Record<string, unknown>) => {
+                            erasureUpdates.push(fields);
+                            return { eq: vi.fn().mockResolvedValue({ error: null }) };
+                        }),
                         eq: vi.fn().mockReturnThis(),
                     };
                 }
@@ -179,15 +190,10 @@ describe('POST /api/account/erase — route handler', async () => {
                         select: vi.fn().mockReturnThis(),
                         eq: vi.fn().mockReturnThis(),
                         maybeSingle: vi.fn().mockResolvedValue({ data: mockStudent }),
-                        // The route unlinks auth_user_id before deleting the auth
-                        // user, so `update(...).eq(...)` must resolve here too.
                         update: vi.fn().mockReturnThis(),
                     };
                 }
                 if (table === 'institutions') {
-                    // Unlink step: .update({ auth_user_id: null, status }).eq(...)
-                    // The final .eq() is awaited, so it must resolve rather than
-                    // return `this`.
                     return {
                         update: vi.fn().mockReturnThis(),
                         select: vi.fn().mockReturnThis(),
@@ -199,6 +205,10 @@ describe('POST /api/account/erase — route handler', async () => {
                         select: vi.fn().mockReturnThis(),
                         eq: vi.fn().mockResolvedValue({ data: mockCreds }),
                     };
+                }
+                if (table === 'institution_users') {
+                    const rows = { data: [], error: null };
+                    return { select: vi.fn(() => ({ eq: vi.fn(() => Promise.resolve(rows)) })) };
                 }
                 return { select: vi.fn().mockReturnThis(), eq: vi.fn().mockReturnThis() };
             }),
@@ -214,7 +224,220 @@ describe('POST /api/account/erase — route handler', async () => {
         });
         // @ts-expect-error NextRequest vs Request
         const res = await POST(req);
+
         expect(res.status).toBe(204);
+
+        // The completed update must have been written.
+        const completedUpdate = erasureUpdates.find((u) => u.status === 'completed');
+        expect(completedUpdate).toBeDefined();
+        expect(completedUpdate?.completed_at).toBeTruthy();
+        // No failed update should have been written.
+        expect(erasureUpdates.find((u) => u.status === 'failed')).toBeUndefined();
+    });
+
+    it('marks the row completed even when auth user deletion soft-fails', async () => {
+        const erasureUpdates: Array<Record<string, unknown>> = [];
+
+        vi.mocked(requireAuthenticatedRequest).mockResolvedValue({
+            ok: true,
+            userId: 'user-uuid',
+            user: { id: 'user-uuid', email: 'test@example.com' } as never,
+            accessToken: 'mock-token',
+        });
+
+        vi.mocked(unpinFromPinata).mockResolvedValue(true);
+
+        const mockServiceClient = {
+            from: vi.fn().mockImplementation((table: string) => {
+                if (table === 'erasure_requests') {
+                    return {
+                        insert: vi.fn().mockReturnThis(),
+                        select: vi.fn().mockReturnThis(),
+                        single: vi.fn().mockResolvedValue({ data: { id: 'er-2' }, error: null }),
+                        update: vi.fn().mockImplementation((fields: Record<string, unknown>) => {
+                            erasureUpdates.push(fields);
+                            return { eq: vi.fn().mockResolvedValue({ error: null }) };
+                        }),
+                        eq: vi.fn().mockReturnThis(),
+                    };
+                }
+                if (table === 'students') {
+                    return {
+                        select: vi.fn().mockReturnThis(),
+                        eq: vi.fn().mockReturnThis(),
+                        maybeSingle: vi.fn().mockResolvedValue({ data: null }),
+                        update: vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null }) })),
+                    };
+                }
+                if (table === 'institutions') {
+                    return {
+                        update: vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null }) })),
+                        select: vi.fn().mockReturnThis(),
+                        eq: vi.fn().mockResolvedValue({ data: null, error: null }),
+                    };
+                }
+                if (table === 'institution_users') {
+                    return { select: vi.fn(() => ({ eq: vi.fn(() => Promise.resolve({ data: [], error: null })) })) };
+                }
+                return { select: vi.fn().mockReturnThis(), eq: vi.fn().mockReturnThis() };
+            }),
+            rpc: vi.fn().mockResolvedValue({ error: null }),
+            // Auth deletion fails (e.g. already deleted externally).
+            auth: { admin: { deleteUser: vi.fn().mockResolvedValue({ error: { message: 'User not found' } }) } },
+        };
+
+        vi.mocked(getServiceRoleClient).mockReturnValue(mockServiceClient as never);
+
+        const req = new Request('http://localhost/api/account/erase', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer mock-token' },
+        });
+        // @ts-expect-error NextRequest vs Request
+        const res = await POST(req);
+
+        // PII was scrubbed — still 204 and still marked completed.
+        expect(res.status).toBe(204);
+        expect(erasureUpdates.find((u) => u.status === 'completed')).toBeDefined();
+    });
+
+    it('marks the row failed and returns 500 when the DB scrub RPC fails', async () => {
+        const erasureUpdates: Array<Record<string, unknown>> = [];
+
+        vi.mocked(requireAuthenticatedRequest).mockResolvedValue({
+            ok: true,
+            userId: 'user-uuid',
+            user: { id: 'user-uuid', email: 'test@example.com' } as never,
+            accessToken: 'mock-token',
+        });
+
+        vi.mocked(unpinFromPinata).mockResolvedValue(true);
+
+        const mockServiceClient = {
+            from: vi.fn().mockImplementation((table: string) => {
+                if (table === 'erasure_requests') {
+                    return {
+                        insert: vi.fn().mockReturnThis(),
+                        select: vi.fn().mockReturnThis(),
+                        single: vi.fn().mockResolvedValue({ data: { id: 'er-3' }, error: null }),
+                        update: vi.fn().mockImplementation((fields: Record<string, unknown>) => {
+                            erasureUpdates.push(fields);
+                            return { eq: vi.fn().mockResolvedValue({ error: null }) };
+                        }),
+                        eq: vi.fn().mockReturnThis(),
+                    };
+                }
+                if (table === 'students') {
+                    return {
+                        select: vi.fn().mockReturnThis(),
+                        eq: vi.fn().mockReturnThis(),
+                        maybeSingle: vi.fn().mockResolvedValue({ data: null }),
+                        update: vi.fn(() => ({ eq: vi.fn().mockResolvedValue({ error: null }) })),
+                    };
+                }
+                if (table === 'institution_users') {
+                    return { select: vi.fn(() => ({ eq: vi.fn(() => Promise.resolve({ data: [], error: null })) })) };
+                }
+                return { select: vi.fn().mockReturnThis(), eq: vi.fn().mockReturnThis() };
+            }),
+            // The DB scrub function fails.
+            rpc: vi.fn().mockResolvedValue({ error: { message: 'function not found' } }),
+            auth: { admin: { deleteUser: vi.fn().mockResolvedValue({ error: null }) } },
+        };
+
+        vi.mocked(getServiceRoleClient).mockReturnValue(mockServiceClient as never);
+
+        const req = new Request('http://localhost/api/account/erase', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer mock-token' },
+        });
+        // @ts-expect-error NextRequest vs Request
+        const res = await POST(req);
+
+        expect(res.status).toBe(500);
+        const body = await res.json();
+        expect(body.success).toBe(false);
+
+        // Row must be marked failed with a reason.
+        const failedUpdate = erasureUpdates.find((u) => u.status === 'failed');
+        expect(failedUpdate).toBeDefined();
+        expect(failedUpdate?.failure_reason).toBeTruthy();
+        // Must NOT have been marked completed.
+        expect(erasureUpdates.find((u) => u.status === 'completed')).toBeUndefined();
+    });
+
+    it('returns 204 and marks completed when IPFS unpinning partially fails', async () => {
+        const erasureUpdates: Array<Record<string, unknown>> = [];
+        const mockCreds = [{ ipfs_hash: 'QmGood' }, { ipfs_hash: 'QmBad' }];
+
+        vi.mocked(requireAuthenticatedRequest).mockResolvedValue({
+            ok: true,
+            userId: 'user-uuid',
+            user: { id: 'user-uuid', email: 'test@example.com' } as never,
+            accessToken: 'mock-token',
+        });
+
+        // First CID succeeds, second fails.
+        vi.mocked(unpinFromPinata)
+            .mockResolvedValueOnce(true)
+            .mockRejectedValueOnce(new Error('Pinata 404'));
+
+        const mockServiceClient = {
+            from: vi.fn().mockImplementation((table: string) => {
+                if (table === 'erasure_requests') {
+                    return {
+                        insert: vi.fn().mockReturnThis(),
+                        select: vi.fn().mockReturnThis(),
+                        single: vi.fn().mockResolvedValue({ data: { id: 'er-4' }, error: null }),
+                        update: vi.fn().mockImplementation((fields: Record<string, unknown>) => {
+                            erasureUpdates.push(fields);
+                            return { eq: vi.fn().mockResolvedValue({ error: null }) };
+                        }),
+                        eq: vi.fn().mockReturnThis(),
+                    };
+                }
+                if (table === 'students') {
+                    return {
+                        select: vi.fn().mockReturnThis(),
+                        eq: vi.fn().mockReturnThis(),
+                        maybeSingle: vi.fn().mockResolvedValue({ data: { id: 'stu-1' } }),
+                        update: vi.fn().mockReturnThis(),
+                    };
+                }
+                if (table === 'credentials') {
+                    return {
+                        select: vi.fn().mockReturnThis(),
+                        eq: vi.fn().mockResolvedValue({ data: mockCreds }),
+                    };
+                }
+                if (table === 'institution_users') {
+                    return { select: vi.fn(() => ({ eq: vi.fn(() => Promise.resolve({ data: [], error: null })) })) };
+                }
+                const generic: Record<string, unknown> = {};
+                Object.assign(generic, {
+                    select: vi.fn(() => generic),
+                    update: vi.fn(() => generic),
+                    eq: vi.fn(() => Promise.resolve({ data: null, error: null })),
+                    maybeSingle: vi.fn().mockResolvedValue({ data: null }),
+                });
+                return generic;
+            }),
+            rpc: vi.fn().mockResolvedValue({ error: null }),
+            auth: { admin: { deleteUser: vi.fn().mockResolvedValue({ error: null }) } },
+        };
+
+        vi.mocked(getServiceRoleClient).mockReturnValue(mockServiceClient as never);
+
+        const req = new Request('http://localhost/api/account/erase', {
+            method: 'POST',
+            headers: { Authorization: 'Bearer mock-token' },
+        });
+        // @ts-expect-error NextRequest vs Request
+        const res = await POST(req);
+
+        // Partial IPFS failure is logged but does not block erasure.
+        expect(res.status).toBe(204);
+        expect(erasureUpdates.find((u) => u.status === 'completed')).toBeDefined();
+        expect(erasureUpdates.find((u) => u.status === 'failed')).toBeUndefined();
     });
 });
 
@@ -239,6 +462,8 @@ describe('POST /api/account/erase — institution membership audit trail', () =>
         const { getServiceRoleClient, requireAuthenticatedRequest } = await import(
             '../src/lib/serverAuth'
         );
+
+        vi.clearAllMocks();
 
         const auditRows: Array<Record<string, unknown>> = [];
 
