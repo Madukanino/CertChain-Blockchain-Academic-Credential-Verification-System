@@ -24,11 +24,20 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 const EVENT_BATCH_SIZE = 1000;
 const POLL_INTERVAL_MS = 5000;
 const MAX_LEDGER_RANGE = 10000;
+const MAX_PAGINATION_PAGES = 500;
 
 function bytesToHex(bytes: Uint8Array): string {
     return Array.from(bytes)
         .map(b => b.toString(16).padStart(2, '0'))
         .join('');
+}
+
+/** Thrown when a processEvent call fails; holds the event id for quarantine logging. */
+class EventProcessingError extends Error {
+    constructor(public readonly eventId: string, cause: unknown) {
+        super(`Failed to process event ${eventId}: ${cause instanceof Error ? cause.message : String(cause)}`);
+        this.cause = cause;
+    }
 }
 
 async function processEvent(event: rpc.Api.EventResponse) {
@@ -172,8 +181,17 @@ async function run() {
             let cursor: string | undefined = undefined;
             let eventsProcessed = 0;
             let hasMore = true;
+            let pageCount = 0;
+            const failedEventIds: string[] = [];
+            let lastSuccessfulLedger = startLedger - 1;
 
             while (hasMore) {
+                if (pageCount >= MAX_PAGINATION_PAGES) {
+                    throw new Error(
+                        `Pagination safety limit reached (${MAX_PAGINATION_PAGES} pages) while syncing ledgers ${startLedger}–${endLedger}. Aborting to avoid infinite loop.`,
+                    );
+                }
+
                 const filters = [{ type: 'contract' as const, contractIds: [contractId] }];
                 // The RPC accepts exactly one of startLedger / cursor — use the
                 // cursor for pagination once we have one, else the start ledger.
@@ -183,27 +201,60 @@ async function run() {
                         : { startLedger, filters, limit: EVENT_BATCH_SIZE },
                 );
 
-                const events = eventsResponse.events;
-                for (const event of events) {
-                    await processEvent(event);
-                    eventsProcessed++;
+                const nextCursor = eventsResponse.cursor;
+                if (nextCursor !== undefined && nextCursor === cursor) {
+                    throw new Error(
+                        `Indexer received a repeated pagination cursor ("${cursor}") — aborting to prevent an infinite loop.`,
+                    );
                 }
 
-                if (events.length > 0) {
-                    // Resume the next page from the response-level cursor.
-                    cursor = eventsResponse.cursor;
+                const events = eventsResponse.events;
+                for (const event of events) {
+                    try {
+                        await processEvent(event);
+                        eventsProcessed++;
+                        // Track the highest ledger we successfully processed.
+                        if (event.ledger > lastSuccessfulLedger) {
+                            lastSuccessfulLedger = event.ledger;
+                        }
+                    } catch (err) {
+                        const eventId = (event as any).id ?? `ledger:${event.ledger}`;
+                        console.error(`Quarantining event ${eventId}:`, err);
+                        failedEventIds.push(eventId);
+                        // Do NOT advance lastSuccessfulLedger past a failed event.
+                    }
+                }
+
+                pageCount++;
+
+                if (events.length > 0 && nextCursor !== undefined) {
+                    cursor = nextCursor;
                 } else {
                     hasMore = false;
                 }
             }
 
-            // Update state
-            await supabase
-                .from('indexer_state')
-                .update({ last_ledger: endLedger, updated_at: new Date().toISOString() })
-                .eq('id', 'main');
+            if (failedEventIds.length > 0) {
+                console.error(
+                    `Indexer quarantined ${failedEventIds.length} event(s): ${failedEventIds.join(', ')}`,
+                );
+            }
 
-            console.log(`Successfully processed ${eventsProcessed} events up to ledger ${endLedger}`);
+            // Only advance the checkpoint to the ledger we actually finished
+            // processing. If events failed we stop at the last successful ledger
+            // so the next run re-attempts the failed range.
+            const committedLedger = failedEventIds.length === 0
+                ? endLedger
+                : lastSuccessfulLedger;
+
+            if (committedLedger >= startLedger) {
+                await supabase
+                    .from('indexer_state')
+                    .update({ last_ledger: committedLedger, updated_at: new Date().toISOString() })
+                    .eq('id', 'main');
+            }
+
+            console.log(`Successfully processed ${eventsProcessed} events up to ledger ${committedLedger}`);
 
             // Delay next iteration
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));

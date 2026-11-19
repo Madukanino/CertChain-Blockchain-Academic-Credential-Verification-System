@@ -146,6 +146,14 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ success: false, error: auth.error }, { status: auth.status });
     }
 
+    if (!process.env.TTL_KEEPER_ACCOUNT_SECRET) {
+        structuredLog('ERROR', 'TTL keeper is misconfigured: TTL_KEEPER_ACCOUNT_SECRET is not set', requestId, {});
+        return NextResponse.json(
+            { success: false, error: 'TTL keeper misconfigured: set TTL_KEEPER_ACCOUNT_SECRET to enable on-chain bumps.' },
+            { status: 503 },
+        );
+    }
+
     try {
         const supabase = getServiceRoleClient();
 
