@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -195,15 +195,21 @@ fn append_to_address_index(env: &Env, key: &DataKey, token_id: u64) {
         .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
-fn require_initialized(env: &Env) {
-    let initialized = env
-        .storage()
+fn is_initialized(env: &Env) -> bool {
+    env.storage()
         .instance()
         .get::<DataKey, bool>(&DataKey::Initialized)
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !initialized {
-        panic!("ContractError({})", ContractError::NotInitialized as u32);
+/// Abort with the typed `ContractError::NotInitialized` (contract error #7)
+/// when `initialize` has not run. `panic_with_error!` surfaces as
+/// `Error(Contract, #7)` on-chain and as `Err(Ok(ContractError::NotInitialized))`
+/// from generated `try_*` clients, so callers no longer have to parse a
+/// formatted panic string (#102).
+fn require_initialized(env: &Env) {
+    if !is_initialized(env) {
+        panic_with_error!(env, ContractError::NotInitialized);
     }
 }
 
@@ -233,6 +239,17 @@ fn extend_credential_ttl(env: &Env, token_id: u64, credential_hash: &BytesN<32>)
         PERSISTENT_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );
+}
+
+/// Extend the TTL of a student/issuer index list if it exists. Pre-v2
+/// credentials have no index entry, and `extend_ttl` on a missing key traps,
+/// so absence is skipped (#103).
+fn extend_address_index_ttl(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
 }
 
 /// Extend the TTL of the TotalCredentials counter.
@@ -870,7 +887,7 @@ impl CertChainCredential {
     }
 
     /// Public bump entry-point so anyone can extend the TTL of any credential
-    /// without modifying it.  This lets off-chain keepers (or the credential
+    /// (and its student/issuer index entries) without modifying it.  This lets off-chain keepers (or the credential
     /// holder) ensure the data stays alive without requiring issuer authority.
     ///
     /// Returns `Err(CredentialNotFound)` when the token_id does not exist
@@ -882,6 +899,11 @@ impl CertChainCredential {
             .get(&DataKey::Credential(token_id))
             .ok_or(ContractError::CredentialNotFound)?;
         extend_credential_ttl(&env, token_id, &credential.credential_hash);
+        // Keep the per-address histories alive with the credential, so a keeper
+        // that only bumps credentials does not let get_credentials_by_student /
+        // get_credentials_by_issuer go incomplete (#103).
+        extend_address_index_ttl(&env, &DataKey::StudentIndex(credential.student.clone()));
+        extend_address_index_ttl(&env, &DataKey::IssuerIndex(credential.issuer.clone()));
         extend_total_credentials_ttl(&env);
         extend_instance_ttl(&env);
         Ok(())
@@ -3158,6 +3180,151 @@ mod tests {
             let info = CertChainCredential::get_contract_info(env.clone());
             assert_eq!(info.name, String::from_str(&env, "CertChain Credential"));
             assert!(info.version.len() > 0);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // #102: uninitialized calls return the typed NotInitialized error
+    // -----------------------------------------------------------------------
+
+    fn uninitialized_client(env: &Env) -> CertChainCredentialClient<'_> {
+        env.mock_all_auths();
+        let contract = CertChainCredential.register(env, None, ());
+        CertChainCredentialClient::new(env, &contract)
+    }
+
+    /// The raw host error every owner-gated or initialization-gated call must
+    /// produce before `initialize`: contract error #7, not a formatted panic.
+    fn not_initialized_error() -> soroban_sdk::Error {
+        soroban_sdk::Error::from_contract_error(ContractError::NotInitialized as u32)
+    }
+
+    #[test]
+    fn test_uninitialized_result_entrypoints_return_not_initialized() {
+        let env = Env::default();
+        let client = uninitialized_client(&env);
+        let someone = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9; 32]);
+        let expected = Err(Ok(ContractError::NotInitialized));
+
+        assert_eq!(client.try_transfer_owner(&someone), expected);
+        assert_eq!(client.try_accept_owner(), expected);
+        assert_eq!(client.try_admin_revoke_credential(&1), expected);
+        assert_eq!(client.try_pause(), expected);
+        assert_eq!(client.try_unpause(), expected);
+        assert_eq!(client.try_propose_upgrade(&hash), expected);
+        assert_eq!(client.try_cancel_upgrade(), expected);
+        assert_eq!(client.try_upgrade(&hash), expected);
+        assert_eq!(client.try_migrate(), expected);
+    }
+
+    #[test]
+    fn test_uninitialized_plain_entrypoints_return_not_initialized_code() {
+        let env = Env::default();
+        let client = uninitialized_client(&env);
+        let someone = Address::generate(&env);
+        let expected = not_initialized_error();
+
+        assert_eq!(client.try_get_owner().err(), Some(Ok(expected)));
+        assert_eq!(client.try_get_pending_owner().err(), Some(Ok(expected)));
+        assert_eq!(client.try_authorize_issuer(&someone).err(), Some(Ok(expected)));
+        assert_eq!(client.try_revoke_issuer(&someone).err(), Some(Ok(expected)));
+        assert_eq!(client.try_is_authorized_issuer(&someone).err(), Some(Ok(expected)));
+        assert_eq!(client.try_total_credentials().err(), Some(Ok(expected)));
+    }
+
+    #[test]
+    fn test_not_initialized_error_code_is_pinned() {
+        // Off-chain clients match on this number; changing it is a breaking change.
+        assert_eq!(ContractError::NotInitialized as u32, 7);
+        assert!(not_initialized_error().is_type(soroban_sdk::xdr::ScErrorType::Contract));
+        assert_eq!(not_initialized_error().get_code(), 7);
+    }
+
+    #[test]
+    fn test_initialized_contract_does_not_report_not_initialized() {
+        let (env, contract, owner, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        assert_eq!(client.get_owner(), owner);
+        assert_eq!(client.try_pause(), Ok(Ok(())));
+    }
+
+    // -----------------------------------------------------------------------
+    // #103: bump_credential keeps the student/issuer index entries alive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bump_credential_extends_address_index_ttls() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, contract, _, issuer, student) = setup();
+        let hash = dummy_hash(&env, 31);
+
+        let token_id = env.as_contract(&contract, || {
+            CertChainCredential::issue_credential(
+                env.clone(),
+                student.clone(),
+                issuer.clone(),
+                hash.clone(),
+                String::from_str(&env, "ipfs://index-ttl"),
+            )
+            .unwrap()
+        });
+
+        let student_key = DataKey::StudentIndex(student.clone());
+        let issuer_key = DataKey::IssuerIndex(issuer.clone());
+
+        // Only the keeper's bump runs between issuance and the late reads; no
+        // enumeration call touches the index entries in between.
+        env.ledger().set_sequence_number(4_000_000);
+        env.as_contract(&contract, || {
+            CertChainCredential::bump_credential(env.clone(), token_id).unwrap();
+        });
+
+        // The bump must have pushed the index entries' TTL out as far as the
+        // credential's own entry.
+        env.as_contract(&contract, || {
+            let credential_ttl = env.storage().persistent().get_ttl(&DataKey::Credential(token_id));
+            assert_eq!(env.storage().persistent().get_ttl(&student_key), credential_ttl);
+            assert_eq!(env.storage().persistent().get_ttl(&issuer_key), credential_ttl);
+            assert!(credential_ttl >= PERSISTENT_THRESHOLD);
+        });
+
+        // Past the TTL the indexes got at issuance: still queryable.
+        env.ledger().set_sequence_number(6_400_000);
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::get_credentials_by_student(env.clone(), student.clone()),
+                vec![&env, token_id]
+            );
+            assert_eq!(
+                CertChainCredential::get_credentials_by_issuer(env.clone(), issuer.clone()),
+                vec![&env, token_id]
+            );
+        });
+    }
+
+    #[test]
+    fn test_bump_credential_without_index_entries_succeeds() {
+        // Pre-v2 credentials were written before the address indexes existed.
+        let (env, contract, _, issuer, student) = setup();
+        let hash = dummy_hash(&env, 32);
+        let token_id = env.as_contract(&contract, || {
+            let id = CertChainCredential::issue_credential(
+                env.clone(),
+                student.clone(),
+                issuer.clone(),
+                hash.clone(),
+                String::from_str(&env, "ipfs://legacy"),
+            )
+            .unwrap();
+            env.storage().persistent().remove(&DataKey::StudentIndex(student.clone()));
+            env.storage().persistent().remove(&DataKey::IssuerIndex(issuer.clone()));
+            id
+        });
+        env.as_contract(&contract, || {
+            assert_eq!(CertChainCredential::bump_credential(env.clone(), token_id), Ok(()));
         });
     }
 } // end mod tests
