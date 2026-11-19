@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { timingSafeEqual, createHash } from 'node:crypto';
 import type { NextRequest } from 'next/server';
 import { serverRuntimeConfig } from '@/lib/runtimeConfig';
 
@@ -6,15 +6,14 @@ export type CronAuthResult =
     | { ok: true }
     | { ok: false; status: number; error: string };
 
+function sha256(input: string): Buffer {
+    return createHash('sha256').update(input, 'utf8').digest();
+}
+
 function constantTimeEquals(a: string, b: string): boolean {
-    const left = Buffer.from(a, 'utf8');
-    const right = Buffer.from(b, 'utf8');
-    // timingSafeEqual throws on length mismatch, which would itself leak the
-    // secret's length, so compare a fixed-size digest of the inputs instead.
-    if (left.length !== right.length) {
-        return false;
-    }
-    return timingSafeEqual(left, right);
+    // Hash both inputs to a fixed 32-byte digest so comparison time does not
+    // depend on input length, preventing timing-based length disclosure.
+    return timingSafeEqual(sha256(a), sha256(b));
 }
 
 /**
