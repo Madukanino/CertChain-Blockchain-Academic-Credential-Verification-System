@@ -4193,4 +4193,236 @@ mod proptest_invariants {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // #106: length caps fuzzed around their boundaries
+    // -----------------------------------------------------------------------
+    //
+    // Caps are enforced on the UTF-8 *byte* length (`String::len`), so a
+    // string of N multibyte characters counts as more than N. Each test builds
+    // strings whose byte length lands just below, on and just above a cap,
+    // from ASCII and from 2-, 3- and 4-byte characters.
+
+    /// Characters of every UTF-8 width; the seed set always includes multibyte.
+    const BOUNDARY_CHARS: [char; 4] = ['a', 'é', '€', '🎓'];
+
+    /// A string of exactly `target` bytes when possible: as many `ch` as fit,
+    /// padded with ASCII to the exact byte count.
+    fn string_with_bytes(ch: char, target: usize) -> std::string::String {
+        let w = ch.len_utf8();
+        let mut out: std::string::String = core::iter::repeat(ch).take(target / w).collect();
+        while out.len() < target {
+            out.push('x');
+        }
+        out
+    }
+
+    /// Byte lengths around `cap`: cap-2 ..= cap+2.
+    fn around(cap: u32) -> impl Strategy<Value = usize> {
+        ((cap as i64 - 2)..=(cap as i64 + 2)).prop_map(|n| n.max(0) as usize)
+    }
+
+    fn boundary_env() -> (Env, Address, Address, Address) {
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+        let contract = CertChainCredential.register(&env, None, ());
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        env.as_contract(&contract, || {
+            CertChainCredential::initialize(env.clone(), owner.clone()).unwrap();
+        });
+        env.as_contract(&contract, || {
+            CertChainCredential::authorize_issuer(env.clone(), issuer.clone());
+        });
+        (env, contract, owner, issuer)
+    }
+
+    #[test]
+    fn string_with_bytes_hits_exact_lengths() {
+        for ch in BOUNDARY_CHARS {
+            for target in [0usize, 1, 63, 64, 65, 255, 256, 257, 511, 512, 513] {
+                let s = string_with_bytes(ch, target);
+                assert_eq!(s.len(), target, "{:?} @ {}", ch, target);
+                if target >= ch.len_utf8() && ch.len_utf8() > 1 {
+                    assert!(
+                        s.chars().count() < target,
+                        "multibyte case must have fewer chars than bytes"
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+
+        /// MAX_IPFS_URI_LEN on single issuance: accepted iff bytes <= cap, and
+        /// a rejected call leaves total_credentials and the token counter unchanged.
+        #[test]
+        fn ipfs_uri_cap_on_issue(ch in prop::sample::select(&BOUNDARY_CHARS[..]), len in around(MAX_IPFS_URI_LEN), seed in any::<u8>()) {
+            let (env, contract, _, issuer) = boundary_env();
+            let student = Address::generate(&env);
+            let uri = string_with_bytes(ch, len);
+            let before = env.as_contract(&contract, || CertChainCredential::total_credentials(env.clone()));
+            let result = env.as_contract(&contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(), student.clone(), issuer.clone(), seed_hash(&env, seed), String::from_str(&env, &uri),
+                )
+            });
+            let after = env.as_contract(&contract, || CertChainCredential::total_credentials(env.clone()));
+            if uri.len() as u32 <= MAX_IPFS_URI_LEN {
+                prop_assert_eq!(result, Ok(1));
+                prop_assert_eq!(after, before + 1);
+                let cred = env.as_contract(&contract, || CertChainCredential::get_credential(env.clone(), 1)).unwrap();
+                prop_assert_eq!(cred.ipfs_hash.len() as usize, uri.len());
+            } else {
+                prop_assert_eq!(result, Err(ContractError::IpfsUriTooLarge));
+                prop_assert_eq!(after, before);
+                prop_assert!(env.as_contract(&contract, || CertChainCredential::verify_credential(env.clone(), seed_hash(&env, seed))).is_none());
+            }
+        }
+
+        /// MAX_IPFS_URI_LEN on batch rows: an over-cap row fails alone with
+        /// IpfsUriTooLarge and does not consume a token id.
+        #[test]
+        fn ipfs_uri_cap_on_batch_row(ch in prop::sample::select(&BOUNDARY_CHARS[..]), len in around(MAX_IPFS_URI_LEN)) {
+            let (env, contract, _, issuer) = boundary_env();
+            let student = Address::generate(&env);
+            let uri = string_with_bytes(ch, len);
+            let rows = soroban_sdk::vec![
+                &env,
+                BatchCredentialInput { student: student.clone(), credential_hash: seed_hash(&env, 1), ipfs_uri: String::from_str(&env, &uri) },
+                BatchCredentialInput { student: student.clone(), credential_hash: seed_hash(&env, 2), ipfs_uri: String::from_str(&env, "ipfs://ok") },
+            ];
+            let results = env
+                .as_contract(&contract, || CertChainCredential::batch_issue_credential(env.clone(), issuer.clone(), rows.clone()))
+                .unwrap();
+            let first = results.get(0).unwrap();
+            let second = results.get(1).unwrap();
+            let total = env.as_contract(&contract, || CertChainCredential::total_credentials(env.clone()));
+            if uri.len() as u32 <= MAX_IPFS_URI_LEN {
+                prop_assert!(first.success);
+                prop_assert_eq!((first.token_id, second.token_id), (1, 2));
+                prop_assert_eq!(total, 2);
+            } else {
+                prop_assert!(!first.success);
+                prop_assert_eq!(first.error_code, ContractError::IpfsUriTooLarge as u32);
+                prop_assert_eq!(first.token_id, 0);
+                prop_assert_eq!(second.token_id, 1, "rejected row must not consume a token id");
+                prop_assert_eq!(total, 1);
+            }
+        }
+
+        /// MAX_ISSUER_NAME_LEN and MAX_ISSUER_PROFILE_URI_LEN: accepted iff both
+        /// byte lengths are within their caps; a rejected update leaves any
+        /// previous profile untouched.
+        #[test]
+        fn issuer_profile_caps(
+            name_ch in prop::sample::select(&BOUNDARY_CHARS[..]),
+            name_len in around(MAX_ISSUER_NAME_LEN),
+            uri_ch in prop::sample::select(&BOUNDARY_CHARS[..]),
+            uri_len in around(MAX_ISSUER_PROFILE_URI_LEN),
+            fuzz_name in any::<bool>(),
+        ) {
+            let (env, contract, _, issuer) = boundary_env();
+            // Fuzz one field at a time against a valid value in the other, so
+            // each cap is checked on its own boundary.
+            let (name, uri) = if fuzz_name {
+                (string_with_bytes(name_ch, name_len), std::string::String::from("https://ok"))
+            } else {
+                (std::string::String::from("Issuer"), string_with_bytes(uri_ch, uri_len))
+            };
+
+            env.as_contract(&contract, || {
+                CertChainCredential::set_issuer_profile(
+                    env.clone(), issuer.clone(),
+                    String::from_str(&env, "Original"), String::from_str(&env, "https://orig"),
+                ).unwrap();
+            });
+            let result = env.as_contract(&contract, || {
+                CertChainCredential::set_issuer_profile(
+                    env.clone(), issuer.clone(), String::from_str(&env, &name), String::from_str(&env, &uri),
+                )
+            });
+            let stored = env.as_contract(&contract, || CertChainCredential::get_issuer_profile(env.clone(), issuer.clone())).unwrap();
+
+            let within = name.len() as u32 <= MAX_ISSUER_NAME_LEN && uri.len() as u32 <= MAX_ISSUER_PROFILE_URI_LEN;
+            if within {
+                prop_assert_eq!(result, Ok(()));
+                prop_assert_eq!(stored.name, String::from_str(&env, &name));
+                prop_assert_eq!(stored.profile_uri, String::from_str(&env, &uri));
+            } else {
+                prop_assert_eq!(result, Err(ContractError::ProfileTooLarge));
+                prop_assert_eq!(stored.name, String::from_str(&env, "Original"));
+                prop_assert_eq!(stored.profile_uri, String::from_str(&env, "https://orig"));
+            }
+        }
+    }
+
+    /// Fixed seed set: exact cap, one byte over, and multibyte strings whose
+    /// character count is under the cap while their byte length is over it.
+    #[test]
+    fn length_cap_seed_set() {
+        let (env, contract, _, issuer) = boundary_env();
+        let student = Address::generate(&env);
+        let issue = |uri: &str, seed: u8| {
+            env.as_contract(&contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(),
+                    student.clone(),
+                    issuer.clone(),
+                    seed_hash(&env, seed),
+                    String::from_str(&env, uri),
+                )
+            })
+        };
+        let cap = MAX_IPFS_URI_LEN as usize;
+        assert!(issue(&string_with_bytes('a', cap), 1).is_ok());
+        assert_eq!(
+            issue(&string_with_bytes('a', cap + 1), 2),
+            Err(ContractError::IpfsUriTooLarge)
+        );
+        // 4-byte chars: exactly the cap in bytes is fine...
+        assert!(issue(&string_with_bytes('🎓', cap), 3).is_ok());
+        // ...but 129 graduation caps (516 bytes, only 129 characters) is over.
+        let over: std::string::String = core::iter::repeat('🎓').take(cap / 4 + 1).collect();
+        assert!(over.chars().count() < cap);
+        assert_eq!(issue(&over, 4), Err(ContractError::IpfsUriTooLarge));
+
+        let profile = |name: &str, uri: &str| {
+            env.as_contract(&contract, || {
+                CertChainCredential::set_issuer_profile(
+                    env.clone(),
+                    issuer.clone(),
+                    String::from_str(&env, name),
+                    String::from_str(&env, uri),
+                )
+            })
+        };
+        let name_cap = MAX_ISSUER_NAME_LEN as usize;
+        let uri_cap = MAX_ISSUER_PROFILE_URI_LEN as usize;
+        assert_eq!(profile(&string_with_bytes('a', name_cap), "u"), Ok(()));
+        assert_eq!(
+            profile(&string_with_bytes('a', name_cap + 1), "u"),
+            Err(ContractError::ProfileTooLarge)
+        );
+        // 33 'é' = 66 bytes but 33 characters: over the byte cap.
+        let accented: std::string::String =
+            core::iter::repeat('é').take(name_cap / 2 + 1).collect();
+        assert_eq!(profile(&accented, "u"), Err(ContractError::ProfileTooLarge));
+        assert_eq!(profile("n", &string_with_bytes('€', uri_cap)), Ok(()));
+        assert_eq!(
+            profile("n", &string_with_bytes('€', uri_cap + 1)),
+            Err(ContractError::ProfileTooLarge)
+        );
+        assert_eq!(
+            env.as_contract(&contract, || CertChainCredential::total_credentials(
+                env.clone()
+            )),
+            2
+        );
+    }
 }
