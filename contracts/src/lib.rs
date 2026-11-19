@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -195,15 +195,21 @@ fn append_to_address_index(env: &Env, key: &DataKey, token_id: u64) {
         .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
-fn require_initialized(env: &Env) {
-    let initialized = env
-        .storage()
+fn is_initialized(env: &Env) -> bool {
+    env.storage()
         .instance()
         .get::<DataKey, bool>(&DataKey::Initialized)
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
-    if !initialized {
-        panic!("ContractError({})", ContractError::NotInitialized as u32);
+/// Abort with the typed `ContractError::NotInitialized` (contract error #7)
+/// when `initialize` has not run. `panic_with_error!` surfaces as
+/// `Error(Contract, #7)` on-chain and as `Err(Ok(ContractError::NotInitialized))`
+/// from generated `try_*` clients, so callers no longer have to parse a
+/// formatted panic string (#102).
+fn require_initialized(env: &Env) {
+    if !is_initialized(env) {
+        panic_with_error!(env, ContractError::NotInitialized);
     }
 }
 
@@ -233,6 +239,17 @@ fn extend_credential_ttl(env: &Env, token_id: u64, credential_hash: &BytesN<32>)
         PERSISTENT_THRESHOLD,
         PERSISTENT_BUMP_AMOUNT,
     );
+}
+
+/// Extend the TTL of a student/issuer index list if it exists. Pre-v2
+/// credentials have no index entry, and `extend_ttl` on a missing key traps,
+/// so absence is skipped (#103).
+fn extend_address_index_ttl(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
 }
 
 /// Extend the TTL of the TotalCredentials counter.
@@ -870,7 +887,7 @@ impl CertChainCredential {
     }
 
     /// Public bump entry-point so anyone can extend the TTL of any credential
-    /// without modifying it.  This lets off-chain keepers (or the credential
+    /// (and its student/issuer index entries) without modifying it.  This lets off-chain keepers (or the credential
     /// holder) ensure the data stays alive without requiring issuer authority.
     ///
     /// Returns `Err(CredentialNotFound)` when the token_id does not exist
@@ -882,6 +899,11 @@ impl CertChainCredential {
             .get(&DataKey::Credential(token_id))
             .ok_or(ContractError::CredentialNotFound)?;
         extend_credential_ttl(&env, token_id, &credential.credential_hash);
+        // Keep the per-address histories alive with the credential, so a keeper
+        // that only bumps credentials does not let get_credentials_by_student /
+        // get_credentials_by_issuer go incomplete (#103).
+        extend_address_index_ttl(&env, &DataKey::StudentIndex(credential.student.clone()));
+        extend_address_index_ttl(&env, &DataKey::IssuerIndex(credential.issuer.clone()));
         extend_total_credentials_ttl(&env);
         extend_instance_ttl(&env);
         Ok(())
@@ -3160,6 +3182,173 @@ mod tests {
             assert!(info.version.len() > 0);
         });
     }
+
+    // -----------------------------------------------------------------------
+    // #102: uninitialized calls return the typed NotInitialized error
+    // -----------------------------------------------------------------------
+
+    fn uninitialized_client(env: &Env) -> CertChainCredentialClient<'_> {
+        env.mock_all_auths();
+        let contract = CertChainCredential.register(env, None, ());
+        CertChainCredentialClient::new(env, &contract)
+    }
+
+    /// The raw host error every owner-gated or initialization-gated call must
+    /// produce before `initialize`: contract error #7, not a formatted panic.
+    fn not_initialized_error() -> soroban_sdk::Error {
+        soroban_sdk::Error::from_contract_error(ContractError::NotInitialized as u32)
+    }
+
+    #[test]
+    fn test_uninitialized_result_entrypoints_return_not_initialized() {
+        let env = Env::default();
+        let client = uninitialized_client(&env);
+        let someone = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[9; 32]);
+        let expected = Err(Ok(ContractError::NotInitialized));
+
+        assert_eq!(client.try_transfer_owner(&someone), expected);
+        assert_eq!(client.try_accept_owner(), expected);
+        assert_eq!(client.try_admin_revoke_credential(&1), expected);
+        assert_eq!(client.try_pause(), expected);
+        assert_eq!(client.try_unpause(), expected);
+        assert_eq!(client.try_propose_upgrade(&hash), expected);
+        assert_eq!(client.try_cancel_upgrade(), expected);
+        assert_eq!(client.try_upgrade(&hash), expected);
+        assert_eq!(client.try_migrate(), expected);
+    }
+
+    #[test]
+    fn test_uninitialized_plain_entrypoints_return_not_initialized_code() {
+        let env = Env::default();
+        let client = uninitialized_client(&env);
+        let someone = Address::generate(&env);
+        let expected = not_initialized_error();
+
+        assert_eq!(client.try_get_owner().err(), Some(Ok(expected)));
+        assert_eq!(client.try_get_pending_owner().err(), Some(Ok(expected)));
+        assert_eq!(
+            client.try_authorize_issuer(&someone).err(),
+            Some(Ok(expected))
+        );
+        assert_eq!(client.try_revoke_issuer(&someone).err(), Some(Ok(expected)));
+        assert_eq!(
+            client.try_is_authorized_issuer(&someone).err(),
+            Some(Ok(expected))
+        );
+        assert_eq!(client.try_total_credentials().err(), Some(Ok(expected)));
+    }
+
+    #[test]
+    fn test_not_initialized_error_code_is_pinned() {
+        // Off-chain clients match on this number; changing it is a breaking change.
+        assert_eq!(ContractError::NotInitialized as u32, 7);
+        assert!(not_initialized_error().is_type(soroban_sdk::xdr::ScErrorType::Contract));
+        assert_eq!(not_initialized_error().get_code(), 7);
+    }
+
+    #[test]
+    fn test_initialized_contract_does_not_report_not_initialized() {
+        let (env, contract, owner, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        assert_eq!(client.get_owner(), owner);
+        assert_eq!(client.try_pause(), Ok(Ok(())));
+    }
+
+    // -----------------------------------------------------------------------
+    // #103: bump_credential keeps the student/issuer index entries alive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bump_credential_extends_address_index_ttls() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, contract, _, issuer, student) = setup();
+        let hash = dummy_hash(&env, 31);
+
+        let token_id = env.as_contract(&contract, || {
+            CertChainCredential::issue_credential(
+                env.clone(),
+                student.clone(),
+                issuer.clone(),
+                hash.clone(),
+                String::from_str(&env, "ipfs://index-ttl"),
+            )
+            .unwrap()
+        });
+
+        let student_key = DataKey::StudentIndex(student.clone());
+        let issuer_key = DataKey::IssuerIndex(issuer.clone());
+
+        // Only the keeper's bump runs between issuance and the late reads; no
+        // enumeration call touches the index entries in between.
+        env.ledger().set_sequence_number(4_000_000);
+        env.as_contract(&contract, || {
+            CertChainCredential::bump_credential(env.clone(), token_id).unwrap();
+        });
+
+        // The bump must have pushed the index entries' TTL out as far as the
+        // credential's own entry.
+        env.as_contract(&contract, || {
+            let credential_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Credential(token_id));
+            assert_eq!(
+                env.storage().persistent().get_ttl(&student_key),
+                credential_ttl
+            );
+            assert_eq!(
+                env.storage().persistent().get_ttl(&issuer_key),
+                credential_ttl
+            );
+            assert!(credential_ttl >= PERSISTENT_THRESHOLD);
+        });
+
+        // Past the TTL the indexes got at issuance: still queryable.
+        env.ledger().set_sequence_number(6_400_000);
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::get_credentials_by_student(env.clone(), student.clone()),
+                vec![&env, token_id]
+            );
+            assert_eq!(
+                CertChainCredential::get_credentials_by_issuer(env.clone(), issuer.clone()),
+                vec![&env, token_id]
+            );
+        });
+    }
+
+    #[test]
+    fn test_bump_credential_without_index_entries_succeeds() {
+        // Pre-v2 credentials were written before the address indexes existed.
+        let (env, contract, _, issuer, student) = setup();
+        let hash = dummy_hash(&env, 32);
+        let token_id = env.as_contract(&contract, || {
+            let id = CertChainCredential::issue_credential(
+                env.clone(),
+                student.clone(),
+                issuer.clone(),
+                hash.clone(),
+                String::from_str(&env, "ipfs://legacy"),
+            )
+            .unwrap();
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StudentIndex(student.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::IssuerIndex(issuer.clone()));
+            id
+        });
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::bump_credential(env.clone(), token_id),
+                Ok(())
+            );
+        });
+    }
 } // end mod tests
 
 // ---------------------------------------------------------------------------
@@ -3183,8 +3372,10 @@ mod proptest_invariants {
     extern crate std;
 
     use super::*;
+    // Weighted `prop_oneof!` expands to `vec![...]`; this crate is no_std.
     use proptest::prelude::*;
     use soroban_sdk::testutils::{Address as _, Register};
+    use std::vec;
 
     fn seed_hash(env: &Env, seed: u8) -> BytesN<32> {
         BytesN::from_array(env, &[seed; 32])
@@ -3336,5 +3527,902 @@ mod proptest_invariants {
                 prop_assert_eq!(verified.token_id, *token_id);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // #105: interleavings of every mutating entrypoint
+    // -----------------------------------------------------------------------
+    //
+    // A model tracks owner/pending owner, pause flag, authorized issuers,
+    // issued credentials (with batch partial-failure semantics), pending
+    // upgrade and storage version; after every step the contract is checked
+    // against it. `upgrade` is only exercised on its rejection paths (no new
+    // WASM is installed in unit tests).
+
+    /// Addresses used by the model: 0..3 are issuers (0..2 start authorized,
+    /// 3 starts unauthorized), owners are picked from `owners`.
+    const N_ISSUERS: usize = 4;
+    const N_STUDENTS: usize = 3;
+    const N_OWNERS: usize = 3;
+
+    #[derive(Debug, Clone)]
+    enum FullOp {
+        Issue {
+            issuer: u8,
+            student: u8,
+            hash: u8,
+            long_uri: bool,
+        },
+        /// `rows` = (student, hash, long_uri). `oversize` sends MAX_BATCH_SIZE + 1 rows.
+        Batch {
+            issuer: u8,
+            rows: std::vec::Vec<(u8, u8, bool)>,
+            oversize: bool,
+        },
+        Revoke {
+            by: u8,
+            pick: u8,
+        },
+        AdminRevoke {
+            pick: u8,
+        },
+        Bump {
+            pick: u8,
+        },
+        Pause,
+        Unpause,
+        AuthorizeIssuer {
+            issuer: u8,
+        },
+        RevokeIssuer {
+            issuer: u8,
+        },
+        SetProfile {
+            issuer: u8,
+            name_len: u8,
+        },
+        TransferOwner {
+            to: u8,
+        },
+        AcceptOwner,
+        ProposeUpgrade {
+            seed: u8,
+        },
+        CancelUpgrade,
+        Upgrade {
+            matching: bool,
+        },
+        Migrate,
+    }
+
+    fn full_op_strategy() -> impl Strategy<Value = FullOp> {
+        let row = (0u8..N_STUDENTS as u8, 0u8..12, prop::bool::weighted(0.1));
+        prop_oneof![
+            4 => (0u8..N_ISSUERS as u8, 0u8..N_STUDENTS as u8, 0u8..12, prop::bool::weighted(0.1))
+                .prop_map(|(issuer, student, hash, long_uri)| FullOp::Issue { issuer, student, hash, long_uri }),
+            4 => (0u8..N_ISSUERS as u8, prop::collection::vec(row, 0..5), prop::bool::weighted(0.05))
+                .prop_map(|(issuer, rows, oversize)| FullOp::Batch { issuer, rows, oversize }),
+            2 => (0u8..N_ISSUERS as u8, any::<u8>()).prop_map(|(by, pick)| FullOp::Revoke { by, pick }),
+            1 => any::<u8>().prop_map(|pick| FullOp::AdminRevoke { pick }),
+            1 => any::<u8>().prop_map(|pick| FullOp::Bump { pick }),
+            2 => Just(FullOp::Pause),
+            2 => Just(FullOp::Unpause),
+            1 => (0u8..N_ISSUERS as u8).prop_map(|issuer| FullOp::AuthorizeIssuer { issuer }),
+            1 => (0u8..N_ISSUERS as u8).prop_map(|issuer| FullOp::RevokeIssuer { issuer }),
+            1 => (0u8..N_ISSUERS as u8, 0u8..80).prop_map(|(issuer, name_len)| FullOp::SetProfile { issuer, name_len }),
+            1 => (0u8..N_OWNERS as u8).prop_map(|to| FullOp::TransferOwner { to }),
+            1 => Just(FullOp::AcceptOwner),
+            1 => any::<u8>().prop_map(|seed| FullOp::ProposeUpgrade { seed }),
+            1 => Just(FullOp::CancelUpgrade),
+            1 => any::<bool>().prop_map(|matching| FullOp::Upgrade { matching }),
+            1 => Just(FullOp::Migrate),
+        ]
+    }
+
+    #[derive(Clone)]
+    struct ModelCredential {
+        token_id: u64,
+        hash_seed: u8,
+        issuer: usize,
+        student: usize,
+        revoked: bool,
+    }
+
+    fn ipfs_uri(env: &Env, long: bool) -> String {
+        if long {
+            let s: std::string::String = "u".repeat(MAX_IPFS_URI_LEN as usize + 1);
+            String::from_str(env, &s)
+        } else {
+            String::from_str(env, "ipfs://model")
+        }
+    }
+
+    /// Run `ops` against a fresh contract and the model. Shared by the
+    /// randomized property test and the seeded regression cases below.
+    fn run_full_model(ops: &[FullOp]) -> Result<(), TestCaseError> {
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+        let contract = CertChainCredential.register(&env, None, ());
+        let owners: std::vec::Vec<Address> =
+            (0..N_OWNERS).map(|_| Address::generate(&env)).collect();
+        let issuers: std::vec::Vec<Address> =
+            (0..N_ISSUERS).map(|_| Address::generate(&env)).collect();
+        let students: std::vec::Vec<Address> =
+            (0..N_STUDENTS).map(|_| Address::generate(&env)).collect();
+        let call = |f: &dyn Fn() -> ()| env.as_contract(&contract, f);
+
+        call(&|| CertChainCredential::initialize(env.clone(), owners[0].clone()).unwrap());
+        for issuer in issuers.iter().take(3) {
+            call(&|| CertChainCredential::authorize_issuer(env.clone(), issuer.clone()));
+        }
+
+        let mut owner = 0usize;
+        let mut pending_owner: Option<usize> = None;
+        let mut paused = false;
+        let mut authorized = [true, true, true, false];
+        let mut used_hashes: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        let mut issued: std::vec::Vec<ModelCredential> = std::vec::Vec::new();
+        let mut next_token: u64 = 1;
+        let mut pending_upgrade: Option<BytesN<32>> = None;
+        let mut storage_version: u32 = 1;
+
+        for op in ops {
+            match op.clone() {
+                FullOp::Issue {
+                    issuer,
+                    student,
+                    hash,
+                    long_uri,
+                } => {
+                    let (i, st) = (issuer as usize, student as usize);
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::issue_credential(
+                            env.clone(),
+                            students[st].clone(),
+                            issuers[i].clone(),
+                            seed_hash(&env, hash),
+                            ipfs_uri(&env, long_uri),
+                        )
+                    });
+                    let expected = if paused {
+                        Err(ContractError::ContractPaused)
+                    } else if !authorized[i] {
+                        Err(ContractError::IssuerNotAuthorized)
+                    } else if long_uri {
+                        Err(ContractError::IpfsUriTooLarge)
+                    } else if used_hashes.contains(&hash) {
+                        Err(ContractError::CredentialAlreadyExists)
+                    } else {
+                        Ok(next_token)
+                    };
+                    prop_assert_eq!(result, expected, "issue {:?}", op);
+                    if let Ok(token_id) = expected {
+                        issued.push(ModelCredential {
+                            token_id,
+                            hash_seed: hash,
+                            issuer: i,
+                            student: st,
+                            revoked: false,
+                        });
+                        used_hashes.insert(hash);
+                        next_token += 1;
+                    }
+                }
+                FullOp::Batch {
+                    issuer,
+                    rows,
+                    oversize,
+                } => {
+                    let i = issuer as usize;
+                    let mut inputs = Vec::new(&env);
+                    let rows: std::vec::Vec<(u8, u8, bool)> = if oversize {
+                        (0..=MAX_BATCH_SIZE)
+                            .map(|n| (0u8, 100u8.wrapping_add(n as u8), false))
+                            .collect()
+                    } else {
+                        rows
+                    };
+                    for (st, hash, long_uri) in rows.iter() {
+                        inputs.push_back(BatchCredentialInput {
+                            student: students[*st as usize].clone(),
+                            credential_hash: seed_hash(&env, *hash),
+                            ipfs_uri: ipfs_uri(&env, *long_uri),
+                        });
+                    }
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::batch_issue_credential(
+                            env.clone(),
+                            issuers[i].clone(),
+                            inputs.clone(),
+                        )
+                    });
+                    if paused {
+                        prop_assert_eq!(result, Err(ContractError::ContractPaused));
+                    } else if !authorized[i] {
+                        prop_assert_eq!(result, Err(ContractError::IssuerNotAuthorized));
+                    } else if rows.is_empty() {
+                        prop_assert_eq!(result, Err(ContractError::EmptyBatch));
+                    } else if rows.len() as u32 > MAX_BATCH_SIZE {
+                        prop_assert_eq!(result, Err(ContractError::BatchTooLarge));
+                    } else {
+                        let results = result.expect("valid batch call must return per-row results");
+                        prop_assert_eq!(results.len() as usize, rows.len());
+                        for (idx, (st, hash, long_uri)) in rows.iter().enumerate() {
+                            let r = results.get(idx as u32).unwrap();
+                            prop_assert_eq!(r.index, idx as u32);
+                            let expected_code = if *long_uri {
+                                ContractError::IpfsUriTooLarge as u32
+                            } else if used_hashes.contains(hash) {
+                                ContractError::CredentialAlreadyExists as u32
+                            } else {
+                                0
+                            };
+                            if expected_code == 0 {
+                                prop_assert!(r.success, "row {} should succeed", idx);
+                                prop_assert_eq!(r.token_id, next_token);
+                                issued.push(ModelCredential {
+                                    token_id: next_token,
+                                    hash_seed: *hash,
+                                    issuer: i,
+                                    student: *st as usize,
+                                    revoked: false,
+                                });
+                                used_hashes.insert(*hash);
+                                next_token += 1;
+                            } else {
+                                prop_assert!(!r.success);
+                                prop_assert_eq!(r.token_id, 0);
+                                prop_assert_eq!(r.error_code, expected_code);
+                            }
+                        }
+                    }
+                }
+                FullOp::Revoke { by, pick } => {
+                    if issued.is_empty() {
+                        continue;
+                    }
+                    let idx = pick as usize % issued.len();
+                    let by = by as usize;
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::revoke_credential(
+                            env.clone(),
+                            issued[idx].token_id,
+                            issuers[by].clone(),
+                        )
+                    });
+                    let expected = if paused {
+                        Err(ContractError::ContractPaused)
+                    } else if issued[idx].issuer != by {
+                        Err(ContractError::UnauthorizedRevoker)
+                    } else if issued[idx].revoked {
+                        Err(ContractError::AlreadyRevoked)
+                    } else {
+                        Ok(())
+                    };
+                    prop_assert_eq!(result, expected);
+                    if expected.is_ok() {
+                        issued[idx].revoked = true;
+                    }
+                }
+                FullOp::AdminRevoke { pick } => {
+                    if issued.is_empty() {
+                        continue;
+                    }
+                    let idx = pick as usize % issued.len();
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::admin_revoke_credential(
+                            env.clone(),
+                            issued[idx].token_id,
+                        )
+                    });
+                    let expected = if paused {
+                        Err(ContractError::ContractPaused)
+                    } else if issued[idx].revoked {
+                        Err(ContractError::AlreadyRevoked)
+                    } else {
+                        Ok(())
+                    };
+                    prop_assert_eq!(result, expected);
+                    if expected.is_ok() {
+                        issued[idx].revoked = true;
+                    }
+                }
+                FullOp::Bump { pick } => {
+                    let token_id = if issued.is_empty() {
+                        9_999
+                    } else {
+                        issued[pick as usize % issued.len()].token_id
+                    };
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::bump_credential(env.clone(), token_id)
+                    });
+                    // Bumping is allowed while paused: it never changes data.
+                    let expected = if issued.is_empty() {
+                        Err(ContractError::CredentialNotFound)
+                    } else {
+                        Ok(())
+                    };
+                    prop_assert_eq!(result, expected);
+                }
+                FullOp::Pause => {
+                    prop_assert_eq!(
+                        env.as_contract(&contract, || CertChainCredential::pause(env.clone())),
+                        Ok(())
+                    );
+                    paused = true;
+                }
+                FullOp::Unpause => {
+                    prop_assert_eq!(
+                        env.as_contract(&contract, || CertChainCredential::unpause(env.clone())),
+                        Ok(())
+                    );
+                    paused = false;
+                }
+                FullOp::AuthorizeIssuer { issuer } => {
+                    call(&|| {
+                        CertChainCredential::authorize_issuer(
+                            env.clone(),
+                            issuers[issuer as usize].clone(),
+                        )
+                    });
+                    authorized[issuer as usize] = true;
+                }
+                FullOp::RevokeIssuer { issuer } => {
+                    call(&|| {
+                        CertChainCredential::revoke_issuer(
+                            env.clone(),
+                            issuers[issuer as usize].clone(),
+                        )
+                    });
+                    authorized[issuer as usize] = false;
+                }
+                FullOp::SetProfile { issuer, name_len } => {
+                    let i = issuer as usize;
+                    let name: std::string::String = "n".repeat(name_len as usize);
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::set_issuer_profile(
+                            env.clone(),
+                            issuers[i].clone(),
+                            String::from_str(&env, &name),
+                            String::from_str(&env, "https://issuer.example"),
+                        )
+                    });
+                    // Profiles are not gated by the pause flag.
+                    let expected = if !authorized[i] {
+                        Err(ContractError::IssuerNotAuthorized)
+                    } else if name_len as u32 > MAX_ISSUER_NAME_LEN {
+                        Err(ContractError::ProfileTooLarge)
+                    } else {
+                        Ok(())
+                    };
+                    prop_assert_eq!(result, expected);
+                }
+                FullOp::TransferOwner { to } => {
+                    let to = to as usize;
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::transfer_owner(env.clone(), owners[to].clone())
+                    });
+                    if to == owner {
+                        prop_assert_eq!(result, Err(ContractError::SameOwner));
+                    } else {
+                        prop_assert_eq!(result, Ok(()));
+                        pending_owner = Some(to);
+                    }
+                }
+                FullOp::AcceptOwner => {
+                    let result = env
+                        .as_contract(&contract, || CertChainCredential::accept_owner(env.clone()));
+                    match pending_owner.take() {
+                        None => prop_assert_eq!(result, Err(ContractError::NoPendingOwner)),
+                        Some(next) => {
+                            prop_assert_eq!(result, Ok(()));
+                            owner = next;
+                        }
+                    }
+                }
+                FullOp::ProposeUpgrade { seed } => {
+                    let hash = BytesN::from_array(&env, &[seed; 32]);
+                    prop_assert_eq!(
+                        env.as_contract(&contract, || CertChainCredential::propose_upgrade(
+                            env.clone(),
+                            hash.clone()
+                        )),
+                        Ok(())
+                    );
+                    pending_upgrade = Some(hash);
+                }
+                FullOp::CancelUpgrade => {
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::cancel_upgrade(env.clone())
+                    });
+                    if pending_upgrade.take().is_some() {
+                        prop_assert_eq!(result, Ok(()));
+                    } else {
+                        prop_assert_eq!(result, Err(ContractError::UpgradeNotProposed));
+                    }
+                }
+                FullOp::Upgrade { matching } => {
+                    let hash = match (&pending_upgrade, matching) {
+                        (Some(h), true) => h.clone(),
+                        _ => BytesN::from_array(&env, &[0xEE; 32]),
+                    };
+                    let result = env.as_contract(&contract, || {
+                        CertChainCredential::upgrade(env.clone(), hash.clone())
+                    });
+                    let expected = match (&pending_upgrade, matching) {
+                        (None, _) => ContractError::UpgradeNotProposed,
+                        (Some(h), false) if *h != hash => ContractError::UpgradeHashMismatch,
+                        // The ledger never advances past the timelock here.
+                        _ => ContractError::UpgradeTimelockActive,
+                    };
+                    prop_assert_eq!(result, Err(expected));
+                }
+                FullOp::Migrate => {
+                    prop_assert_eq!(
+                        env.as_contract(&contract, || CertChainCredential::migrate(env.clone())),
+                        Ok(())
+                    );
+                    storage_version = 2;
+                }
+            }
+
+            // ── Invariants after every step ──
+            let (got_owner, got_pending, got_paused, total, version, upgrade) =
+                env.as_contract(&contract, || {
+                    (
+                        CertChainCredential::get_owner(env.clone()),
+                        CertChainCredential::get_pending_owner(env.clone()),
+                        CertChainCredential::is_paused(env.clone()),
+                        CertChainCredential::total_credentials(env.clone()),
+                        CertChainCredential::get_storage_version(env.clone()),
+                        CertChainCredential::get_pending_upgrade(env.clone()),
+                    )
+                });
+            prop_assert_eq!(&got_owner, &owners[owner]);
+            prop_assert_eq!(got_pending, pending_owner.map(|p| owners[p].clone()));
+            prop_assert_eq!(got_paused, paused);
+            prop_assert_eq!(
+                total,
+                issued.len() as u64,
+                "total_credentials tracks successful issuances"
+            );
+            prop_assert_eq!(version, storage_version);
+            prop_assert_eq!(upgrade.map(|u| u.wasm_hash), pending_upgrade.clone());
+            for (i, issuer) in issuers.iter().enumerate() {
+                let is_auth = env.as_contract(&contract, || {
+                    CertChainCredential::is_authorized_issuer(env.clone(), issuer.clone())
+                });
+                prop_assert_eq!(is_auth, authorized[i], "issuer {} authorization", i);
+            }
+        }
+
+        // ── Final state: every credential readable by id, hash and indexes ──
+        for cred in issued.iter() {
+            let got = env
+                .as_contract(&contract, || {
+                    CertChainCredential::get_credential(env.clone(), cred.token_id)
+                })
+                .expect("issued credential must be readable");
+            prop_assert_eq!(&got.issuer, &issuers[cred.issuer]);
+            prop_assert_eq!(&got.student, &students[cred.student]);
+            prop_assert_eq!(got.revoked, cred.revoked);
+            let by_hash = env
+                .as_contract(&contract, || {
+                    CertChainCredential::verify_credential(
+                        env.clone(),
+                        seed_hash(&env, cred.hash_seed),
+                    )
+                })
+                .expect("issued credential must be readable by hash");
+            prop_assert_eq!(by_hash.token_id, cred.token_id);
+        }
+        for (st, student) in students.iter().enumerate() {
+            let expected: std::vec::Vec<u64> = issued
+                .iter()
+                .filter(|c| c.student == st)
+                .map(|c| c.token_id)
+                .collect();
+            let got = env.as_contract(&contract, || {
+                CertChainCredential::get_credentials_by_student(env.clone(), student.clone())
+            });
+            prop_assert_eq!(got.iter().collect::<std::vec::Vec<u64>>(), expected);
+        }
+        for (i, issuer) in issuers.iter().enumerate() {
+            let expected: std::vec::Vec<u64> = issued
+                .iter()
+                .filter(|c| c.issuer == i)
+                .map(|c| c.token_id)
+                .collect();
+            let got = env.as_contract(&contract, || {
+                CertChainCredential::get_credentials_by_issuer(env.clone(), issuer.clone())
+            });
+            prop_assert_eq!(got.iter().collect::<std::vec::Vec<u64>>(), expected);
+        }
+        Ok(())
+    }
+
+    proptest! {
+        // Fixed case count; failing inputs are shrunk and printed by proptest
+        // so they can be added to `seeded_full_model_regressions` below.
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn invariant_all_mutating_entrypoints_hold(ops in prop::collection::vec(full_op_strategy(), 1..30)) {
+            run_full_model(&ops)?;
+        }
+    }
+
+    /// Seeded regression set: hand-picked interleavings that must always pass.
+    /// They pin batch partial failures, pause gating and issuer revocation
+    /// between batch rows, so a regression in any of them fails the suite
+    /// deterministically, independent of the random property run.
+    #[test]
+    fn seeded_full_model_regressions() {
+        use FullOp::*;
+        let seeds: std::vec::Vec<std::vec::Vec<FullOp>> = std::vec![
+            // Batch partial failure: in-batch duplicate, stored duplicate, long URI.
+            std::vec![
+                Issue {
+                    issuer: 0,
+                    student: 0,
+                    hash: 1,
+                    long_uri: false
+                },
+                Batch {
+                    issuer: 0,
+                    rows: std::vec![
+                        (0, 2, false),
+                        (1, 2, false),
+                        (2, 1, false),
+                        (1, 3, true),
+                        (2, 4, false)
+                    ],
+                    oversize: false
+                },
+            ],
+            // Pause blocks both issuance paths and revocation; unpause restores them.
+            std::vec![
+                Issue {
+                    issuer: 1,
+                    student: 1,
+                    hash: 5,
+                    long_uri: false
+                },
+                Pause,
+                Batch {
+                    issuer: 1,
+                    rows: std::vec![(0, 6, false)],
+                    oversize: false
+                },
+                Issue {
+                    issuer: 1,
+                    student: 0,
+                    hash: 6,
+                    long_uri: false
+                },
+                Revoke { by: 1, pick: 0 },
+                AdminRevoke { pick: 0 },
+                Bump { pick: 0 },
+                Unpause,
+                Batch {
+                    issuer: 1,
+                    rows: std::vec![(0, 6, false)],
+                    oversize: false
+                },
+                Revoke { by: 1, pick: 0 },
+                AdminRevoke { pick: 0 },
+            ],
+            // Revoked issuer: whole batch fails, earlier credentials stay valid; re-authorize.
+            std::vec![
+                Batch {
+                    issuer: 2,
+                    rows: std::vec![(0, 7, false), (1, 8, false)],
+                    oversize: false
+                },
+                RevokeIssuer { issuer: 2 },
+                Batch {
+                    issuer: 2,
+                    rows: std::vec![(0, 9, false)],
+                    oversize: false
+                },
+                SetProfile {
+                    issuer: 2,
+                    name_len: 4
+                },
+                AuthorizeIssuer { issuer: 2 },
+                Issue {
+                    issuer: 2,
+                    student: 2,
+                    hash: 9,
+                    long_uri: false
+                },
+                Issue {
+                    issuer: 3,
+                    student: 2,
+                    hash: 10,
+                    long_uri: false
+                },
+            ],
+            // Empty and oversize batches never change counters.
+            std::vec![
+                Batch {
+                    issuer: 0,
+                    rows: std::vec![],
+                    oversize: false
+                },
+                Batch {
+                    issuer: 0,
+                    rows: std::vec![],
+                    oversize: true
+                },
+                Issue {
+                    issuer: 0,
+                    student: 0,
+                    hash: 11,
+                    long_uri: false
+                },
+            ],
+            // Ownership handover and upgrade bookkeeping interleaved with issuance.
+            std::vec![
+                TransferOwner { to: 0 },
+                AcceptOwner,
+                TransferOwner { to: 1 },
+                Issue {
+                    issuer: 0,
+                    student: 0,
+                    hash: 3,
+                    long_uri: false
+                },
+                AcceptOwner,
+                AdminRevoke { pick: 0 },
+                ProposeUpgrade { seed: 7 },
+                Upgrade { matching: false },
+                Upgrade { matching: true },
+                CancelUpgrade,
+                CancelUpgrade,
+                Migrate,
+                Migrate,
+            ],
+        ];
+        for (n, ops) in seeds.iter().enumerate() {
+            if let Err(e) = run_full_model(ops) {
+                panic!("seeded regression case {} failed: {}", n, e);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // #106: length caps fuzzed around their boundaries
+    // -----------------------------------------------------------------------
+    //
+    // Caps are enforced on the UTF-8 *byte* length (`String::len`), so a
+    // string of N multibyte characters counts as more than N. Each test builds
+    // strings whose byte length lands just below, on and just above a cap,
+    // from ASCII and from 2-, 3- and 4-byte characters.
+
+    /// Characters of every UTF-8 width; the seed set always includes multibyte.
+    const BOUNDARY_CHARS: [char; 4] = ['a', 'é', '€', '🎓'];
+
+    /// A string of exactly `target` bytes when possible: as many `ch` as fit,
+    /// padded with ASCII to the exact byte count.
+    fn string_with_bytes(ch: char, target: usize) -> std::string::String {
+        let w = ch.len_utf8();
+        let mut out: std::string::String = core::iter::repeat(ch).take(target / w).collect();
+        while out.len() < target {
+            out.push('x');
+        }
+        out
+    }
+
+    /// Byte lengths around `cap`: cap-2 ..= cap+2.
+    fn around(cap: u32) -> impl Strategy<Value = usize> {
+        ((cap as i64 - 2)..=(cap as i64 + 2)).prop_map(|n| n.max(0) as usize)
+    }
+
+    fn boundary_env() -> (Env, Address, Address, Address) {
+        let env = Env::new_with_config(soroban_sdk::testutils::EnvTestConfig {
+            capture_snapshot_at_drop: false,
+        });
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+        let contract = CertChainCredential.register(&env, None, ());
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        env.as_contract(&contract, || {
+            CertChainCredential::initialize(env.clone(), owner.clone()).unwrap();
+        });
+        env.as_contract(&contract, || {
+            CertChainCredential::authorize_issuer(env.clone(), issuer.clone());
+        });
+        (env, contract, owner, issuer)
+    }
+
+    #[test]
+    fn string_with_bytes_hits_exact_lengths() {
+        for ch in BOUNDARY_CHARS {
+            for target in [0usize, 1, 63, 64, 65, 255, 256, 257, 511, 512, 513] {
+                let s = string_with_bytes(ch, target);
+                assert_eq!(s.len(), target, "{:?} @ {}", ch, target);
+                if target >= ch.len_utf8() && ch.len_utf8() > 1 {
+                    assert!(
+                        s.chars().count() < target,
+                        "multibyte case must have fewer chars than bytes"
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+
+        /// MAX_IPFS_URI_LEN on single issuance: accepted iff bytes <= cap, and
+        /// a rejected call leaves total_credentials and the token counter unchanged.
+        #[test]
+        fn ipfs_uri_cap_on_issue(ch in prop::sample::select(&BOUNDARY_CHARS[..]), len in around(MAX_IPFS_URI_LEN), seed in any::<u8>()) {
+            let (env, contract, _, issuer) = boundary_env();
+            let student = Address::generate(&env);
+            let uri = string_with_bytes(ch, len);
+            let before = env.as_contract(&contract, || CertChainCredential::total_credentials(env.clone()));
+            let result = env.as_contract(&contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(), student.clone(), issuer.clone(), seed_hash(&env, seed), String::from_str(&env, &uri),
+                )
+            });
+            let after = env.as_contract(&contract, || CertChainCredential::total_credentials(env.clone()));
+            if uri.len() as u32 <= MAX_IPFS_URI_LEN {
+                prop_assert_eq!(result, Ok(1));
+                prop_assert_eq!(after, before + 1);
+                let cred = env.as_contract(&contract, || CertChainCredential::get_credential(env.clone(), 1)).unwrap();
+                prop_assert_eq!(cred.ipfs_hash.len() as usize, uri.len());
+            } else {
+                prop_assert_eq!(result, Err(ContractError::IpfsUriTooLarge));
+                prop_assert_eq!(after, before);
+                prop_assert!(env.as_contract(&contract, || CertChainCredential::verify_credential(env.clone(), seed_hash(&env, seed))).is_none());
+            }
+        }
+
+        /// MAX_IPFS_URI_LEN on batch rows: an over-cap row fails alone with
+        /// IpfsUriTooLarge and does not consume a token id.
+        #[test]
+        fn ipfs_uri_cap_on_batch_row(ch in prop::sample::select(&BOUNDARY_CHARS[..]), len in around(MAX_IPFS_URI_LEN)) {
+            let (env, contract, _, issuer) = boundary_env();
+            let student = Address::generate(&env);
+            let uri = string_with_bytes(ch, len);
+            let rows = soroban_sdk::vec![
+                &env,
+                BatchCredentialInput { student: student.clone(), credential_hash: seed_hash(&env, 1), ipfs_uri: String::from_str(&env, &uri) },
+                BatchCredentialInput { student: student.clone(), credential_hash: seed_hash(&env, 2), ipfs_uri: String::from_str(&env, "ipfs://ok") },
+            ];
+            let results = env
+                .as_contract(&contract, || CertChainCredential::batch_issue_credential(env.clone(), issuer.clone(), rows.clone()))
+                .unwrap();
+            let first = results.get(0).unwrap();
+            let second = results.get(1).unwrap();
+            let total = env.as_contract(&contract, || CertChainCredential::total_credentials(env.clone()));
+            if uri.len() as u32 <= MAX_IPFS_URI_LEN {
+                prop_assert!(first.success);
+                prop_assert_eq!((first.token_id, second.token_id), (1, 2));
+                prop_assert_eq!(total, 2);
+            } else {
+                prop_assert!(!first.success);
+                prop_assert_eq!(first.error_code, ContractError::IpfsUriTooLarge as u32);
+                prop_assert_eq!(first.token_id, 0);
+                prop_assert_eq!(second.token_id, 1, "rejected row must not consume a token id");
+                prop_assert_eq!(total, 1);
+            }
+        }
+
+        /// MAX_ISSUER_NAME_LEN and MAX_ISSUER_PROFILE_URI_LEN: accepted iff both
+        /// byte lengths are within their caps; a rejected update leaves any
+        /// previous profile untouched.
+        #[test]
+        fn issuer_profile_caps(
+            name_ch in prop::sample::select(&BOUNDARY_CHARS[..]),
+            name_len in around(MAX_ISSUER_NAME_LEN),
+            uri_ch in prop::sample::select(&BOUNDARY_CHARS[..]),
+            uri_len in around(MAX_ISSUER_PROFILE_URI_LEN),
+            fuzz_name in any::<bool>(),
+        ) {
+            let (env, contract, _, issuer) = boundary_env();
+            // Fuzz one field at a time against a valid value in the other, so
+            // each cap is checked on its own boundary.
+            let (name, uri) = if fuzz_name {
+                (string_with_bytes(name_ch, name_len), std::string::String::from("https://ok"))
+            } else {
+                (std::string::String::from("Issuer"), string_with_bytes(uri_ch, uri_len))
+            };
+
+            env.as_contract(&contract, || {
+                CertChainCredential::set_issuer_profile(
+                    env.clone(), issuer.clone(),
+                    String::from_str(&env, "Original"), String::from_str(&env, "https://orig"),
+                ).unwrap();
+            });
+            let result = env.as_contract(&contract, || {
+                CertChainCredential::set_issuer_profile(
+                    env.clone(), issuer.clone(), String::from_str(&env, &name), String::from_str(&env, &uri),
+                )
+            });
+            let stored = env.as_contract(&contract, || CertChainCredential::get_issuer_profile(env.clone(), issuer.clone())).unwrap();
+
+            let within = name.len() as u32 <= MAX_ISSUER_NAME_LEN && uri.len() as u32 <= MAX_ISSUER_PROFILE_URI_LEN;
+            if within {
+                prop_assert_eq!(result, Ok(()));
+                prop_assert_eq!(stored.name, String::from_str(&env, &name));
+                prop_assert_eq!(stored.profile_uri, String::from_str(&env, &uri));
+            } else {
+                prop_assert_eq!(result, Err(ContractError::ProfileTooLarge));
+                prop_assert_eq!(stored.name, String::from_str(&env, "Original"));
+                prop_assert_eq!(stored.profile_uri, String::from_str(&env, "https://orig"));
+            }
+        }
+    }
+
+    /// Fixed seed set: exact cap, one byte over, and multibyte strings whose
+    /// character count is under the cap while their byte length is over it.
+    #[test]
+    fn length_cap_seed_set() {
+        let (env, contract, _, issuer) = boundary_env();
+        let student = Address::generate(&env);
+        let issue = |uri: &str, seed: u8| {
+            env.as_contract(&contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(),
+                    student.clone(),
+                    issuer.clone(),
+                    seed_hash(&env, seed),
+                    String::from_str(&env, uri),
+                )
+            })
+        };
+        let cap = MAX_IPFS_URI_LEN as usize;
+        assert!(issue(&string_with_bytes('a', cap), 1).is_ok());
+        assert_eq!(
+            issue(&string_with_bytes('a', cap + 1), 2),
+            Err(ContractError::IpfsUriTooLarge)
+        );
+        // 4-byte chars: exactly the cap in bytes is fine...
+        assert!(issue(&string_with_bytes('🎓', cap), 3).is_ok());
+        // ...but 129 graduation caps (516 bytes, only 129 characters) is over.
+        let over: std::string::String = core::iter::repeat('🎓').take(cap / 4 + 1).collect();
+        assert!(over.chars().count() < cap);
+        assert_eq!(issue(&over, 4), Err(ContractError::IpfsUriTooLarge));
+
+        let profile = |name: &str, uri: &str| {
+            env.as_contract(&contract, || {
+                CertChainCredential::set_issuer_profile(
+                    env.clone(),
+                    issuer.clone(),
+                    String::from_str(&env, name),
+                    String::from_str(&env, uri),
+                )
+            })
+        };
+        let name_cap = MAX_ISSUER_NAME_LEN as usize;
+        let uri_cap = MAX_ISSUER_PROFILE_URI_LEN as usize;
+        assert_eq!(profile(&string_with_bytes('a', name_cap), "u"), Ok(()));
+        assert_eq!(
+            profile(&string_with_bytes('a', name_cap + 1), "u"),
+            Err(ContractError::ProfileTooLarge)
+        );
+        // 33 'é' = 66 bytes but 33 characters: over the byte cap.
+        let accented: std::string::String =
+            core::iter::repeat('é').take(name_cap / 2 + 1).collect();
+        assert_eq!(profile(&accented, "u"), Err(ContractError::ProfileTooLarge));
+        assert_eq!(profile("n", &string_with_bytes('€', uri_cap)), Ok(()));
+        assert_eq!(
+            profile("n", &string_with_bytes('€', uri_cap + 1)),
+            Err(ContractError::ProfileTooLarge)
+        );
+        assert_eq!(
+            env.as_contract(&contract, || CertChainCredential::total_credentials(
+                env.clone()
+            )),
+            2
+        );
     }
 }
