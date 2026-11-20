@@ -163,13 +163,13 @@ caller that constructs the contract call directly (bypassing the app) faces no o
 all. A legitimate IPFS URI is well under 100 bytes (a CIDv1 in base32 is ~60 chars, plus the
 `ipfs://` scheme); there is no honest reason for it to run into the hundreds of bytes.
 
-**Fix**: added `MAX_IPFS_URI_LEN = 256` and a typed `IpfsUriTooLarge` error, enforced on-chain in
+**Fix**: added `MAX_IPFS_URI_LEN = 512` and a typed `IpfsUriTooLarge` error, enforced on-chain in
 **both** issuance entry points. `issue_credential` rejects an oversized URI with
 `Err(IpfsUriTooLarge)` before writing any state. `batch_issue_credential` treats it as a per-row
 failure — the offending row is recorded as a failed `BatchIssueResult` with
 `error_code = IpfsUriTooLarge` and skipped, while the remaining rows are still attempted (matching
 the existing duplicate-hash handling), so one bad row does not fail the whole batch. The bound of
-256 bytes is generous for any real IPFS URI (see above) while keeping each credential a
+512 bytes covers the longest realistic IPFS and gateway URIs (see above) while keeping each credential a
 bounded-size persistent entry. The public signatures are unchanged, so this is not an ABI change
 for callers issuing within the limit.
 
