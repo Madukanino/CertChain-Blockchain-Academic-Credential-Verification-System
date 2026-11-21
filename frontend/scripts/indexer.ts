@@ -2,14 +2,25 @@ import { config as loadEnv } from 'dotenv';
 loadEnv({ quiet: true }); // Load .env if running directly
 import { rpc, scValToNative } from '@stellar/stellar-sdk';
 import { createClient } from '@supabase/supabase-js';
+import { getConfiguredContractId } from '../src/lib/runtimeConfig';
 
 const RPC_URL = process.env.NEXT_PUBLIC_SOROBAN_RPC_URL;
-const CONTRACT_ID = process.env.NEXT_PUBLIC_CREDENTIAL_NFT_CONTRACT_ID;
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!RPC_URL || !CONTRACT_ID || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+if (!RPC_URL || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     console.error('Missing required environment variables');
+    process.exit(1);
+}
+
+// Resolve the credential NFT contract ID through the same helper the app uses
+// so a single env change (NEXT_PUBLIC_CREDENTIAL_NFT_CONTRACT_ID) keeps the
+// indexer and the app pointed at the same contract.
+let CONTRACT_ID: string;
+try {
+    CONTRACT_ID = getConfiguredContractId('CREDENTIAL_NFT');
+} catch (e) {
+    console.error('Invalid credential NFT contract configuration:', e instanceof Error ? e.message : e);
     process.exit(1);
 }
 
@@ -194,77 +205,54 @@ async function run() {
 
                 const filters = [{ type: 'contract' as const, contractIds: [contractId] }];
                 // The RPC accepts exactly one of startLedger / cursor — use the
-                // cursor for pagination once we have one, else the start ledger.
-                const eventsResponse = await server.getEvents(
-                    cursor
-                        ? { filters, limit: EVENT_BATCH_SIZE, cursor }
-                        : { startLedger, filters, limit: EVENT_BATCH_SIZE },
-                );
+                // cursor for subsequent pages so we don't re-fetch the first page.
+                const request: rpc.Server.GetEventsRequest = cursor
+                    ? { filters, cursor, limit: EVENT_BATCH_SIZE }
+                    : { filters, startLedger, limit: EVENT_BATCH_SIZE };
 
-                const nextCursor = eventsResponse.cursor;
-                if (nextCursor !== undefined && nextCursor === cursor) {
-                    throw new Error(
-                        `Indexer received a repeated pagination cursor ("${cursor}") — aborting to prevent an infinite loop.`,
-                    );
-                }
+                const response = await server.getEvents(request);
+                const events = response.events ?? [];
 
-                const events = eventsResponse.events;
                 for (const event of events) {
                     try {
                         await processEvent(event);
                         eventsProcessed++;
-                        // Track the highest ledger we successfully processed.
-                        if (event.ledger > lastSuccessfulLedger) {
-                            lastSuccessfulLedger = event.ledger;
-                        }
-                    } catch (err) {
-                        const eventId = (event as any).id ?? `ledger:${event.ledger}`;
-                        console.error(`Quarantining event ${eventId}:`, err);
+                        lastSuccessfulLedger = Math.max(lastSuccessfulLedger, event.ledger);
+                    } catch (e) {
+                        const eventId = `${event.ledger}:${event.txHash ?? 'unknown'}`;
                         failedEventIds.push(eventId);
-                        // Do NOT advance lastSuccessfulLedger past a failed event.
+                        console.error(new EventProcessingError(eventId, e).message);
                     }
                 }
 
                 pageCount++;
-
-                if (events.length > 0 && nextCursor !== undefined) {
-                    cursor = nextCursor;
-                } else {
-                    hasMore = false;
-                }
+                cursor = response.cursor;
+                hasMore = events.length === EVENT_BATCH_SIZE && Boolean(cursor);
             }
 
             if (failedEventIds.length > 0) {
                 console.error(
-                    `Indexer quarantined ${failedEventIds.length} event(s): ${failedEventIds.join(', ')}`,
+                    `Quarantined ${failedEventIds.length} event(s) in ledgers ${startLedger}–${endLedger}: ${failedEventIds.join(', ')}`,
                 );
             }
 
-            // Only advance the checkpoint to the ledger we actually finished
-            // processing. If events failed we stop at the last successful ledger
-            // so the next run re-attempts the failed range.
-            const committedLedger = failedEventIds.length === 0
-                ? endLedger
-                : lastSuccessfulLedger;
+            // Persist progress up to the last successfully processed ledger so a
+            // failed event is retried on the next poll instead of being skipped.
+            const nextLedger = Math.max(lastSuccessfulLedger + 1, startLedger);
+            await supabase
+                .from('indexer_state')
+                .update({ last_ledger: nextLedger - 1 })
+                .eq('id', 'main');
 
-            if (committedLedger >= startLedger) {
-                await supabase
-                    .from('indexer_state')
-                    .update({ last_ledger: committedLedger, updated_at: new Date().toISOString() })
-                    .eq('id', 'main');
-            }
-
-            console.log(`Successfully processed ${eventsProcessed} events up to ledger ${committedLedger}`);
-
-            // Delay next iteration
-            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-
-        } catch (error) {
-            console.error('Indexer encountered an error:', error);
-            // Wait before retrying on error
+            console.log(`Synced up to ledger ${nextLedger - 1} (${eventsProcessed} events)`);
+        } catch (e) {
+            console.error('Indexer loop error:', e);
             await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
         }
     }
 }
 
-run().catch(console.error);
+run().catch((e) => {
+    console.error('Fatal indexer error:', e);
+    process.exit(1);
+});
