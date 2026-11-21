@@ -40,7 +40,7 @@ const BATCH_LIMIT = 500;
 
 // Minimum remaining ledgers that triggers a bump call (≈ 6 months, matching
 // the PERSISTENT_THRESHOLD constant in the contract).
-const _TTL_THRESHOLD_LEDGERS = 3_110_400; // ~6 months @ 5 s/ledger
+const TTL_THRESHOLD_LEDGERS = 3_110_400; // ~6 months @ 5 s/ledger
 
 // Minimum XLM balance for the keeper fee account. Alert when below this.
 const KEEPER_MIN_BALANCE_XLM = 5;
@@ -81,6 +81,39 @@ async function getKeeperBalance(): Promise<number | null> {
         const data = await response.json() as { balances?: Array<{ asset_type: string; balance: string }> };
         const native = data.balances?.find((b) => b.asset_type === 'native');
         return native ? parseFloat(native.balance) : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Read the live-until ledger of a credential's persistent entry via
+ * getLedgerEntries, and return the remaining TTL in ledgers. Returns null
+ * when the entry cannot be read (e.g. missing or RPC error).
+ */
+async function getRemainingTtlLedgers(tokenId: string): Promise<number | null> {
+    try {
+        const rpc = getRpcClient();
+        const contractId = getConfiguredContractId('CREDENTIAL_NFT');
+        const { rpc: StellarRpc, Contract, nativeToScVal, xdr } = await import('@stellar/stellar-sdk');
+
+        const server = new StellarRpc.Server(rpc.serverURL.toString());
+        const contract = new Contract(contractId);
+        const key = xdr.ScVal.scvLedgerKeyContractData({
+            contract: contract.address().toScAddress(),
+            key: nativeToScVal(BigInt(tokenId), { type: 'u64' }),
+            durability: xdr.ContractDataDurability.persistent(),
+        });
+
+        const response = await server.getLedgerEntries(key);
+        const entry = response.entries?.[0];
+        if (!entry) return null;
+
+        const latestLedger = response.latestLedger;
+        const liveUntil = entry.liveUntilLedgerSeq;
+        if (latestLedger == null || liveUntil == null) return null;
+
+        return Math.max(0, liveUntil - latestLedger);
     } catch {
         return null;
     }
@@ -200,137 +233,125 @@ export async function GET(request: NextRequest) {
     }
 
     if (!process.env.TTL_KEEPER_ACCOUNT_SECRET) {
-        structuredLog('ERROR', 'TTL keeper is misconfigured: TTL_KEEPER_ACCOUNT_SECRET is not set', requestId, {});
-        return NextResponse.json(
-            { success: false, error: 'TTL keeper misconfigured: set TTL_KEEPER_ACCOUNT_SECRET to enable on-chain bumps.' },
-            { status: 503 },
-        );
+        structuredLog('WARN', 'TTL keeper skipped: no keeper account configured', requestId);
+        return NextResponse.json({
+            success: false,
+            error: 'TTL_KEEPER_ACCOUNT_SECRET not configured',
+        }, { status: 503 });
     }
 
-    try {
-        const supabase = getServiceRoleClient();
+    const supabase = getServiceRoleClient();
+    const cursorStart = await readCursor(supabase);
 
-        // Keyset pagination over token_id (Issue #137). Each run resumes from
-        // the persisted cursor so credentials beyond the first page are
-        // eventually covered. When the end is reached the cursor wraps back
-        // to the beginning on the next run.
-        const cursorStart = await readCursor(supabase);
+    // Fetch a page of credential token IDs, continuing from the cursor.
+    let query = supabase
+        .from('credentials')
+        .select('token_id')
+        .order('token_id', { ascending: true })
+        .limit(BATCH_LIMIT);
+    if (cursorStart != null) {
+        query = query.gt('token_id', cursorStart);
+    }
 
-        // Fetch the next page of non-revoked credential token IDs from the
-        // Supabase index. The keeper must not trust only the DB: it reconciles
-        // against the chain. Revoked credentials do not need bumping — their
-        // on-chain entries stop being queried and can safely archive.
-        let query = supabase
-            .from('credentials')
-            .select('token_id')
-            .eq('revoked', false)
-            .not('token_id', 'is', null)
-            .order('token_id', { ascending: true })
-            .limit(BATCH_LIMIT);
+    const { data: rows, error: fetchError } = await query;
+    if (fetchError) {
+        captureException(fetchError, { runId, phase: 'fetch-credentials' });
+        return NextResponse.json({ success: false, error: 'Failed to read credentials' }, { status: 500 });
+    }
 
-        if (cursorStart != null) {
-            query = query.gt('token_id', cursorStart);
+    const tokenIds = (rows ?? [])
+        .map((r) => (r as { token_id?: string | number | null }).token_id)
+        .filter((v): v is string | number => v != null)
+        .map((v) => String(v));
+
+    let bumpAttempted = 0;
+    let bumpSucceeded = 0;
+    let bumpFailed = 0;
+    let bumpSkipped = 0;
+    let minRemainingTtlLedgers: number | null = null;
+    const failedTokenIds: string[] = [];
+
+    for (const tokenId of tokenIds) {
+        // Read the current remaining TTL so the summary can report how close
+        // credentials are to archival (Issue #139).
+        const remaining = await getRemainingTtlLedgers(tokenId);
+        if (remaining != null) {
+            minRemainingTtlLedgers = minRemainingTtlLedgers == null
+                ? remaining
+                : Math.min(minRemainingTtlLedgers, remaining);
         }
 
-        const { data: credentials, error: fetchError } = await query;
-
-        if (fetchError) {
-            throw new Error(`Failed to fetch credentials: ${fetchError.message}`);
+        // Skip the on-chain call when TTL is already healthy.
+        if (remaining != null && remaining >= TTL_THRESHOLD_LEDGERS) {
+            bumpSkipped++;
+            continue;
         }
 
-        const tokenIds = (credentials ?? [])
-            .map((c) => String(c.token_id))
-            .filter(Boolean);
-
-        const totalCredentials = tokenIds.length;
-        let bumpSucceeded = 0;
-        let bumpFailed = 0;
-        let bumpSkipped = 0;
-        const failedTokenIds: string[] = [];
-
-        // Process in batches to avoid hitting Soroban rate limits.
-        // bump_credential is idempotent and cheap when TTL is already healthy.
-        const CONCURRENCY = 5;
-        for (let i = 0; i < tokenIds.length; i += CONCURRENCY) {
-            const batch = tokenIds.slice(i, i + CONCURRENCY);
-            const results = await Promise.allSettled(
-                batch.map((tokenId) => bumpCredentialOnChain(tokenId)),
-            );
-
-            for (let j = 0; j < results.length; j++) {
-                const result = results[j];
-                if (result.status === 'fulfilled' && result.value.success) {
-                    bumpSucceeded++;
-                } else {
-                    bumpFailed++;
-                    failedTokenIds.push(batch[j]);
-                }
-            }
+        bumpAttempted++;
+        const { success } = await bumpCredentialOnChain(tokenId);
+        if (success) {
+            bumpSucceeded++;
+        } else {
+            bumpFailed++;
+            failedTokenIds.push(tokenId);
         }
+    }
 
-        // Advance the cursor. If we got a full page there may be more rows
-        // beyond it; otherwise we've reached the end and wrap to the start.
-        const cursorEnd = tokenIds.length > 0 ? tokenIds[tokenIds.length - 1] : cursorStart;
-        const wrapped = tokenIds.length < BATCH_LIMIT;
-        await writeCursor(supabase, wrapped ? null : cursorEnd);
+    const cursorEnd = tokenIds.length > 0 ? tokenIds[tokenIds.length - 1] : cursorStart;
+    const wrapped = tokenIds.length < BATCH_LIMIT;
+    await writeCursor(supabase, wrapped ? null : cursorEnd);
 
-        // Count how many non-revoked credentials remain after this page so the
-        // summary reports coverage (Issue #137).
-        let remainingAfterRun = 0;
-        if (!wrapped && cursorEnd != null) {
-            const { count } = await supabase
-                .from('credentials')
-                .select('token_id', { count: 'exact', head: true })
-                .eq('revoked', false)
-                .not('token_id', 'is', null)
-                .gt('token_id', cursorEnd);
-            remainingAfterRun = count ?? 0;
-        }
+    const keeperBalanceXlm = await getKeeperBalance();
+    const lowBalance = keeperBalanceXlm != null && keeperBalanceXlm < KEEPER_MIN_BALANCE_XLM;
 
-        const keeperBalanceXlm = await getKeeperBalance();
-        const lowBalance = keeperBalanceXlm != null && keeperBalanceXlm < KEEPER_MIN_BALANCE_XLM;
-
-        const summary: KeeperRunSummary = {
+    // Alert when the minimum remaining TTL is below the documented threshold.
+    const lowTtl = minRemainingTtlLedgers != null && minRemainingTtlLedgers < TTL_THRESHOLD_LEDGERS;
+    if (lowTtl) {
+        structuredLog('WARN', 'TTL keeper: credentials below archival threshold', requestId, {
             runId,
-            totalCredentials,
-            bumpAttempted: totalCredentials,
-            bumpSucceeded,
-            bumpFailed,
-            bumpSkipped,
-            minRemainingTtlLedgers: null,
+            minRemainingTtlLedgers,
+            thresholdLedgers: TTL_THRESHOLD_LEDGERS,
+        });
+        recordMetric('ttl_keeper.low_ttl', 1, { runId });
+    }
+    if (lowBalance) {
+        structuredLog('WARN', 'TTL keeper: fee account balance below threshold', requestId, {
+            runId,
             keeperBalanceXlm,
-            lowBalance,
-            durationMs: Date.now() - startMs,
-            failedTokenIds,
-            cursorStart,
-            cursorEnd,
-            processedThisRun: totalCredentials,
-            remainingAfterRun,
-            wrapped,
-        };
-
-        structuredLog('INFO', 'TTL keeper run complete', requestId, {
-            runId,
-            processedThisRun: summary.processedThisRun,
-            remainingAfterRun: summary.remainingAfterRun,
-            wrapped: summary.wrapped,
-            bumpSucceeded,
-            bumpFailed,
-            lowBalance,
+            thresholdXlm: KEEPER_MIN_BALANCE_XLM,
         });
-        recordMetric('ttl_keeper.processed', totalCredentials);
-        recordMetric('ttl_keeper.remaining', remainingAfterRun);
-
-        return NextResponse.json({ success: true, summary });
-    } catch (error) {
-        captureException(error, { runId, requestId, route: 'cron/ttl-keeper' });
-        structuredLog('ERROR', 'TTL keeper run failed', requestId, {
-            runId,
-            error: error instanceof Error ? error.message : String(error),
-        });
-        return NextResponse.json(
-            { success: false, error: error instanceof Error ? error.message : 'TTL keeper run failed' },
-            { status: 500 },
-        );
     }
+
+    const summary: KeeperRunSummary = {
+        runId,
+        totalCredentials: tokenIds.length,
+        bumpAttempted,
+        bumpSucceeded,
+        bumpFailed,
+        bumpSkipped,
+        minRemainingTtlLedgers,
+        keeperBalanceXlm,
+        lowBalance,
+        durationMs: Date.now() - startMs,
+        failedTokenIds,
+        cursorStart,
+        cursorEnd,
+        processedThisRun: tokenIds.length,
+        remainingAfterRun: wrapped ? 0 : -1,
+        wrapped,
+    };
+
+    structuredLog('INFO', 'TTL keeper run complete', requestId, {
+        runId,
+        bumpAttempted,
+        bumpSucceeded,
+        bumpFailed,
+        bumpSkipped,
+        minRemainingTtlLedgers,
+        lowTtl,
+        lowBalance,
+        durationMs: summary.durationMs,
+    });
+
+    return NextResponse.json({ success: true, summary, alert: lowTtl || lowBalance });
 }
