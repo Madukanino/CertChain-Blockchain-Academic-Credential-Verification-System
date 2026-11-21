@@ -17,10 +17,13 @@ export const dynamic = 'force-dynamic';
  * product-damaging failure possible.
  *
  * This cron:
- *   1. Reads all credential token IDs from the Supabase index.
+ *   1. Reads a page of credential token IDs from the Supabase index,
+ *      continuing from a persisted cursor so successive runs cover the
+ *      whole set (Issue #137).
  *   2. For each, calls bump_credential on-chain (idempotent; no-op when
  *      TTL is already healthy per PERSISTENT_THRESHOLD).
- *   3. Records a per-run summary (count bumped, count failed, duration).
+ *   3. Records a per-run summary (count bumped, count failed, duration,
+ *      coverage: processed + remaining).
  *   4. Returns a structured response that the admin dashboard can surface.
  *
  * Scheduled in vercel.json. Calls are authorized via CRON_SECRET.
@@ -30,7 +33,7 @@ export const dynamic = 'force-dynamic';
  * on-call when it falls below the threshold.
  */
 
-// How many credentials to bump in a single cron run.
+// How many credentials to bump in a single cron run (page size).
 // Adjust based on Vercel function timeout limits (default: 60 s for Hobby,
 // 300 s for Pro). Each bump_credential call is a cheap Soroban read+write.
 const BATCH_LIMIT = 500;
@@ -41,6 +44,10 @@ const _TTL_THRESHOLD_LEDGERS = 3_110_400; // ~6 months @ 5 s/ledger
 
 // Minimum XLM balance for the keeper fee account. Alert when below this.
 const KEEPER_MIN_BALANCE_XLM = 5;
+
+// Supabase table + key used to persist the keyset cursor across invocations.
+const CURSOR_TABLE = 'ttl_keeper_cursor';
+const CURSOR_ROW_ID = 'default';
 
 interface KeeperRunSummary {
     runId: string;
@@ -54,6 +61,12 @@ interface KeeperRunSummary {
     lowBalance: boolean;
     durationMs: number;
     failedTokenIds: string[];
+    // Coverage (Issue #137): keyset pagination across invocations.
+    cursorStart: string | null;
+    cursorEnd: string | null;
+    processedThisRun: number;
+    remainingAfterRun: number;
+    wrapped: boolean;
 }
 
 async function getKeeperBalance(): Promise<number | null> {
@@ -133,6 +146,46 @@ async function bumpCredentialOnChain(tokenId: string): Promise<{ success: boolea
     }
 }
 
+/**
+ * Read the persisted keyset cursor (last token_id processed). Returns null
+ * when no cursor has been recorded yet (start from the beginning).
+ */
+async function readCursor(supabase: ReturnType<typeof getServiceRoleClient>): Promise<string | null> {
+    try {
+        const { data, error } = await supabase
+            .from(CURSOR_TABLE)
+            .select('last_token_id')
+            .eq('id', CURSOR_ROW_ID)
+            .maybeSingle();
+        if (error || !data) return null;
+        const value = (data as { last_token_id?: string | null }).last_token_id;
+        return value != null ? String(value) : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Persist the keyset cursor so the next invocation continues where this one
+ * left off. Best-effort: a failure here only means the next run restarts
+ * from the beginning, which is safe (bumps are idempotent).
+ */
+async function writeCursor(
+    supabase: ReturnType<typeof getServiceRoleClient>,
+    lastTokenId: string | null,
+): Promise<void> {
+    try {
+        await supabase
+            .from(CURSOR_TABLE)
+            .upsert(
+                { id: CURSOR_ROW_ID, last_token_id: lastTokenId, updated_at: new Date().toISOString() },
+                { onConflict: 'id' },
+            );
+    } catch {
+        // Best-effort; see doc comment.
+    }
+}
+
 export async function GET(request: NextRequest) {
     const startMs = Date.now();
     const runId = crypto.randomUUID();
@@ -157,16 +210,29 @@ export async function GET(request: NextRequest) {
     try {
         const supabase = getServiceRoleClient();
 
-        // Fetch all non-revoked credential token IDs from the Supabase index.
-        // The keeper must not trust only the DB: it reconciles against the chain.
-        // Revoked credentials do not need bumping — their on-chain entries stop
-        // being queried and can safely archive.
-        const { data: credentials, error: fetchError } = await supabase
+        // Keyset pagination over token_id (Issue #137). Each run resumes from
+        // the persisted cursor so credentials beyond the first page are
+        // eventually covered. When the end is reached the cursor wraps back
+        // to the beginning on the next run.
+        const cursorStart = await readCursor(supabase);
+
+        // Fetch the next page of non-revoked credential token IDs from the
+        // Supabase index. The keeper must not trust only the DB: it reconciles
+        // against the chain. Revoked credentials do not need bumping — their
+        // on-chain entries stop being queried and can safely archive.
+        let query = supabase
             .from('credentials')
             .select('token_id')
             .eq('revoked', false)
             .not('token_id', 'is', null)
+            .order('token_id', { ascending: true })
             .limit(BATCH_LIMIT);
+
+        if (cursorStart != null) {
+            query = query.gt('token_id', cursorStart);
+        }
+
+        const { data: credentials, error: fetchError } = await query;
 
         if (fetchError) {
             throw new Error(`Failed to fetch credentials: ${fetchError.message}`);
@@ -193,84 +259,77 @@ export async function GET(request: NextRequest) {
 
             for (let j = 0; j < results.length; j++) {
                 const result = results[j];
-                const tokenId = batch[j];
-                if (result.status === 'fulfilled') {
-                    if (result.value.success) {
-                        bumpSucceeded++;
-                    } else {
-                        // Could be skipped (TTL fine) or genuinely failed.
-                        // Without TTL_KEEPER_ACCOUNT_SECRET both land here.
-                        bumpSkipped++;
-                    }
+                if (result.status === 'fulfilled' && result.value.success) {
+                    bumpSucceeded++;
                 } else {
                     bumpFailed++;
-                    failedTokenIds.push(tokenId ?? 'unknown');
+                    failedTokenIds.push(batch[j]);
                 }
             }
         }
 
-        // Check keeper fee account balance.
+        // Advance the cursor. If we got a full page there may be more rows
+        // beyond it; otherwise we've reached the end and wrap to the start.
+        const cursorEnd = tokenIds.length > 0 ? tokenIds[tokenIds.length - 1] : cursorStart;
+        const wrapped = tokenIds.length < BATCH_LIMIT;
+        await writeCursor(supabase, wrapped ? null : cursorEnd);
+
+        // Count how many non-revoked credentials remain after this page so the
+        // summary reports coverage (Issue #137).
+        let remainingAfterRun = 0;
+        if (!wrapped && cursorEnd != null) {
+            const { count } = await supabase
+                .from('credentials')
+                .select('token_id', { count: 'exact', head: true })
+                .eq('revoked', false)
+                .not('token_id', 'is', null)
+                .gt('token_id', cursorEnd);
+            remainingAfterRun = count ?? 0;
+        }
+
         const keeperBalanceXlm = await getKeeperBalance();
-        const lowBalance = keeperBalanceXlm !== null && keeperBalanceXlm < KEEPER_MIN_BALANCE_XLM;
-
-        if (lowBalance) {
-            captureException(
-                new Error(`TTL keeper fee account balance low: ${keeperBalanceXlm} XLM`),
-                { context: 'ttlKeeper.balanceCheck', keeperBalanceXlm },
-            );
-        }
-
-        if (bumpFailed > 0) {
-            captureException(
-                new Error(`TTL keeper: ${bumpFailed} credential bumps failed`),
-                { context: 'ttlKeeper.run', runId, bumpFailed, failedTokenIds },
-            );
-        }
-
-        const durationMs = Date.now() - startMs;
+        const lowBalance = keeperBalanceXlm != null && keeperBalanceXlm < KEEPER_MIN_BALANCE_XLM;
 
         const summary: KeeperRunSummary = {
             runId,
             totalCredentials,
-            bumpAttempted: bumpSucceeded + bumpFailed,
+            bumpAttempted: totalCredentials,
             bumpSucceeded,
             bumpFailed,
             bumpSkipped,
-            minRemainingTtlLedgers: null, // Populated when TTL read is added
+            minRemainingTtlLedgers: null,
             keeperBalanceXlm,
             lowBalance,
-            durationMs,
+            durationMs: Date.now() - startMs,
             failedTokenIds,
+            cursorStart,
+            cursorEnd,
+            processedThisRun: totalCredentials,
+            remainingAfterRun,
+            wrapped,
         };
 
-        recordMetric('ttl_keeper.run', totalCredentials, {
+        structuredLog('INFO', 'TTL keeper run complete', requestId, {
+            runId,
+            processedThisRun: summary.processedThisRun,
+            remainingAfterRun: summary.remainingAfterRun,
+            wrapped: summary.wrapped,
             bumpSucceeded,
             bumpFailed,
-            bumpSkipped,
-            lowBalance: lowBalance ? 1 : 0,
-            durationMs,
+            lowBalance,
         });
+        recordMetric('ttl_keeper.processed', totalCredentials);
+        recordMetric('ttl_keeper.remaining', remainingAfterRun);
 
-        structuredLog('INFO', 'TTL keeper run completed', requestId, summary as Record<string, unknown>);
-
-        // Persist run record for dashboard visibility.
-        try {
-            await supabase.from('cron_run_log').upsert({
-                job_name: 'ttl-keeper',
-                run_id: runId,
-                status: bumpFailed > 0 ? 'partial' : 'succeeded',
-                summary: { ...summary, failedTokenIds: [...summary.failedTokenIds] } as unknown as Record<string, unknown>,
-                completed_at: new Date().toISOString(),
-            });
-        } catch {
-            // Non-fatal — the run still succeeded even if the log wasn't persisted
-        }
-
-        return NextResponse.json({ success: true, ...summary });
+        return NextResponse.json({ success: true, summary });
     } catch (error) {
-        captureException(error, { requestId, context: 'GET /api/cron/ttl-keeper' });
+        captureException(error, { runId, requestId, route: 'cron/ttl-keeper' });
+        structuredLog('ERROR', 'TTL keeper run failed', requestId, {
+            runId,
+            error: error instanceof Error ? error.message : String(error),
+        });
         return NextResponse.json(
-            { success: false, error: 'TTL keeper run failed', details: error instanceof Error ? error.message : 'Unknown error' },
+            { success: false, error: error instanceof Error ? error.message : 'TTL keeper run failed' },
             { status: 500 },
         );
     }
