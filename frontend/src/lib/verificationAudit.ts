@@ -63,7 +63,7 @@ export function hashAuditValue(value: string | null | undefined): string | null 
     return createHmac('sha256', getHashSecret()).update(normalized).digest('hex');
 }
 
-function buildVerificationResult(log: VerificationAuditLog) {
+export function buildVerificationResult(log: VerificationAuditLog) {
     return {
         schema_version: 2,
         result_type: log.resultType,

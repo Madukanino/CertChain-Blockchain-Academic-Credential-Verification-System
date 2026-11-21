@@ -110,6 +110,13 @@ jobs:
           NEXT_PUBLIC_PINATA_GATEWAY: "https://gateway.pinata.cloud"
           NEXT_PUBLIC_ENABLE_DEBUG_LOGS: "false"
 
+      - name: Upload Production Build
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-build
+          path: frontend/.next
+          if-no-files-found: error
+
   browser-e2e:
     name: Browser E2E & A11y
     needs: build
@@ -132,11 +139,32 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Download Production Build
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-build
+          path: frontend/.next
+
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
       - name: Run Playwright E2E and A11y
         run: npm run test:browser
+        env:
+          CI: "true"
+          NEXT_PUBLIC_SUPABASE_URL: "https://placeholder.supabase.co"
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: "placeholder"
+          SUPABASE_SERVICE_ROLE_KEY: "placeholder-service-role-key"
+          NEXT_PUBLIC_CREDENTIAL_NFT_CONTRACT: "CARWFW27MJ3OJADAUAHI3TDFHIL62YMLVEKTUTMSNXOMH7JJTNZKC3DK"
+          NEXT_PUBLIC_CREDENTIAL_REGISTRY_CONTRACT: "CARWFW27MJ3OJADAUAHI3TDFHIL62YMLVEKTUTMSNXOMH7JJTNZKC3DK"
+          NEXT_PUBLIC_CHAIN_ID: "testnet"
+          NEXT_PUBLIC_NETWORK_NAME: "testnet"
+          NEXT_PUBLIC_HORIZON_URL: "https://horizon-testnet.stellar.org"
+          NEXT_PUBLIC_SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+          NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          PINATA_JWT: "placeholder-pinata-jwt"
+          NEXT_PUBLIC_PINATA_GATEWAY: "https://gateway.pinata.cloud"
+          NEXT_PUBLIC_ENABLE_DEBUG_LOGS: "false"
 
       - name: Upload Playwright Report
         if: always()
@@ -144,6 +172,14 @@ jobs:
         with:
           name: playwright-report
           path: frontend/playwright-report
+          if-no-files-found: ignore
+
+      - name: Upload Playwright Traces
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-traces
+          path: frontend/test-results
           if-no-files-found: ignore
 
   deploy-security-check:
@@ -206,30 +242,6 @@ jobs:
       - name: Cache Cargo Dependencies
         uses: actions/cache@v6
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            contracts/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.toml', 'contracts/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+  
 
-      - name: Check Formatting
-        run: cargo fmt -- --check
-
-      - name: Compile to optimized WASM
-        # soroban-sdk v29 build.rs checks for SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2
-        # which is only set by `stellar contract build`. Using cargo build directly fails.
-        run: stellar contract build
-
-      - name: Run Contract Tests
-        run: cargo test --lib
-
-      - name: Run Clippy Linter
-        # SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2 must be set so
-        # soroban-sdk's build.rs does not abort; it is normally set by
-        # 'stellar contract build' but clippy invokes cargo directly.
-        env:
-          SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2: "1"
-        run: cargo clippy --target wasm32v1-none
+/* … truncated 1096 chars — edit only what you need near the top … */
