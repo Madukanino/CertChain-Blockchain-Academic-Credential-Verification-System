@@ -26,6 +26,17 @@ const webServerEnv = {
 const PORT = process.env.PLAYWRIGHT_PORT ?? '3199';
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
+// The browser suite runs against the production build (`npm run start`), not
+// the dev server: dev-only CSP and middleware behaviour would otherwise hide
+// production regressions (ACREDIA-STELLAR#131). CI builds the app in an
+// earlier job and hands the output to this one; locally, run `npm run build`
+// first. `PLAYWRIGHT_DEV_SERVER=1` opts back into the dev server for the fast
+// edit-run loop.
+const useDevServer = process.env.PLAYWRIGHT_DEV_SERVER === '1';
+const webServerCommand = useDevServer
+    ? `npm run dev -- --port ${PORT}`
+    : `npm run start -- --port ${PORT}`;
+
 export default defineConfig({
     testDir: './tests/playwright',
     // Runs before any spec and refuses to continue unless the base URL is
@@ -44,7 +55,7 @@ export default defineConfig({
         trace: 'retain-on-failure',
     },
     webServer: {
-        command: `npm run dev -- --port ${PORT}`,
+        command: webServerCommand,
         url: BASE_URL,
         // CI always starts its own server: a reused one there could only come
         // from a leaked process on a shared runner, which is never what we

@@ -110,6 +110,13 @@ jobs:
           NEXT_PUBLIC_PINATA_GATEWAY: "https://gateway.pinata.cloud"
           NEXT_PUBLIC_ENABLE_DEBUG_LOGS: "false"
 
+      - name: Upload Production Build
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-build
+          path: frontend/.next
+          if-no-files-found: error
+
   browser-e2e:
     name: Browser E2E & A11y
     needs: build
@@ -132,11 +139,31 @@ jobs:
       - name: Install Dependencies
         run: npm ci
 
+      - name: Download Production Build
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-build
+          path: frontend/.next
+
       - name: Install Playwright Chromium
         run: npx playwright install --with-deps chromium
 
       - name: Run Playwright E2E and A11y
         run: npm run test:browser
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: "https://placeholder.supabase.co"
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: "placeholder"
+          SUPABASE_SERVICE_ROLE_KEY: "placeholder-service-role-key"
+          NEXT_PUBLIC_CREDENTIAL_NFT_CONTRACT: "CARWFW27MJ3OJADAUAHI3TDFHIL62YMLVEKTUTMSNXOMH7JJTNZKC3DK"
+          NEXT_PUBLIC_CREDENTIAL_REGISTRY_CONTRACT: "CARWFW27MJ3OJADAUAHI3TDFHIL62YMLVEKTUTMSNXOMH7JJTNZKC3DK"
+          NEXT_PUBLIC_CHAIN_ID: "testnet"
+          NEXT_PUBLIC_NETWORK_NAME: "testnet"
+          NEXT_PUBLIC_HORIZON_URL: "https://horizon-testnet.stellar.org"
+          NEXT_PUBLIC_SOROBAN_RPC_URL: "https://soroban-testnet.stellar.org"
+          NEXT_PUBLIC_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+          PINATA_JWT: "placeholder-pinata-jwt"
+          NEXT_PUBLIC_PINATA_GATEWAY: "https://gateway.pinata.cloud"
+          NEXT_PUBLIC_ENABLE_DEBUG_LOGS: "false"
 
       - name: Upload Playwright Report
         if: always()
@@ -144,6 +171,14 @@ jobs:
         with:
           name: playwright-report
           path: frontend/playwright-report
+          if-no-files-found: ignore
+
+      - name: Upload Playwright Traces
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-traces
+          path: frontend/test-results
           if-no-files-found: ignore
 
   deploy-security-check:
