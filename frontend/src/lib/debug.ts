@@ -81,37 +81,57 @@ export function structuredLog(
     }
 }
 
+/**
+ * Ingest URL is server-only. A public (NEXT_PUBLIC_*) variant is intentionally
+ * not read here: anything in the browser bundle could be used to forge metrics.
+ */
 function getObservabilityIngestUrl(): string | undefined {
-    return process.env.NEXT_PUBLIC_OBSERVABILITY_INGEST_URL || process.env.OBSERVABILITY_INGEST_URL;
+    return process.env.OBSERVABILITY_INGEST_URL;
 }
 
-function sendObservabilityEvent(payload: Record<string, unknown>) {
+/**
+ * Returns a shared-secret header value when configured. The secret is server-only.
+ */
+function getObservabilityIngestSecret(): string | undefined {
+    return process.env.OBSERVABILITY_INGEST_SECRET;
+}
+
+/**
+ * Delivers an observability event. Returns a promise that resolves once the
+ * request has completed (or failed), so serverless callers can await it before
+ * the function freezes. Failures are logged, never thrown.
+ */
+export async function sendObservabilityEvent(payload: Record<string, unknown>): Promise<void> {
     const ingestUrl = getObservabilityIngestUrl();
     if (!ingestUrl) return;
 
     try {
         const body = JSON.stringify(scrubSensitiveData(payload));
-        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-            navigator.sendBeacon(ingestUrl, new Blob([body], { type: 'application/json' }));
-            return;
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const secret = getObservabilityIngestSecret();
+        if (secret) {
+            headers['Authorization'] = `Bearer ${secret}`;
         }
 
-        void fetch(ingestUrl, {
+        const response = await fetch(ingestUrl, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body,
             keepalive: true,
         });
+        if (!response.ok) {
+            console.error('Observability ingest rejected event:', response.status);
+        }
     } catch (e) {
         console.error('Error in sendObservabilityEvent:', e);
     }
 }
 
-export function recordMetric(
+export async function recordMetric(
     name: string,
     value: number,
     context?: Record<string, unknown>
-) {
+): Promise<void> {
     const payload = {
         timestamp: new Date().toISOString(),
         level: 'INFO',
@@ -122,10 +142,10 @@ export function recordMetric(
     };
 
     console.info(JSON.stringify(payload));
-    sendObservabilityEvent(payload);
+    await sendObservabilityEvent(payload);
 }
 
-export function captureException(error: unknown, context?: Record<string, unknown>) {
+export async function captureException(error: unknown, context?: Record<string, unknown>): Promise<void> {
     try {
         const cleanContext = scrubSensitiveData(context);
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -141,7 +161,7 @@ export function captureException(error: unknown, context?: Record<string, unknow
         };
 
         console.error(JSON.stringify(payload));
-        sendObservabilityEvent(payload);
+        await sendObservabilityEvent(payload);
     } catch (e) {
         console.error('Error in captureException:', e);
     }
