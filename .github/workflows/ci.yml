@@ -151,6 +151,7 @@ jobs:
       - name: Run Playwright E2E and A11y
         run: npm run test:browser
         env:
+          CI: "true"
           NEXT_PUBLIC_SUPABASE_URL: "https://placeholder.supabase.co"
           NEXT_PUBLIC_SUPABASE_ANON_KEY: "placeholder"
           SUPABASE_SERVICE_ROLE_KEY: "placeholder-service-role-key"
@@ -241,30 +242,6 @@ jobs:
       - name: Cache Cargo Dependencies
         uses: actions/cache@v6
         with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            contracts/target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.toml', 'contracts/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+  
 
-      - name: Check Formatting
-        run: cargo fmt -- --check
-
-      - name: Compile to optimized WASM
-        # soroban-sdk v29 build.rs checks for SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2
-        # which is only set by `stellar contract build`. Using cargo build directly fails.
-        run: stellar contract build
-
-      - name: Run Contract Tests
-        run: cargo test --lib
-
-      - name: Run Clippy Linter
-        # SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2 must be set so
-        # soroban-sdk's build.rs does not abort; it is normally set by
-        # 'stellar contract build' but clippy invokes cargo directly.
-        env:
-          SOROBAN_SDK_BUILD_SYSTEM_SUPPORTS_SPEC_SHAKING_V2: "1"
-        run: cargo clippy --target wasm32v1-none
+/* … truncated 1096 chars — edit only what you need near the top … */

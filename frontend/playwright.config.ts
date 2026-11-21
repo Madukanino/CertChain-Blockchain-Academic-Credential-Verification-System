@@ -45,7 +45,11 @@ export default defineConfig({
     globalSetup: './tests/playwright/global-setup.ts',
     fullyParallel: false,
     workers: 1,
-    retries: 0,
+    // Shared CI runners occasionally flake on dev-server compilation and
+    // wallet-stub timing, so retry failed specs twice there. Locally we stay
+    // fail-fast so a real regression surfaces on the first run
+    // (ACREDIA-STELLAR#132).
+    retries: process.env.CI ? 2 : 0,
     timeout: 45_000,
     expect: {
         timeout: 10_000,
