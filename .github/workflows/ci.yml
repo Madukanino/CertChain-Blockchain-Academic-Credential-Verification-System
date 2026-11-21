@@ -146,6 +146,36 @@ jobs:
           path: frontend/playwright-report
           if-no-files-found: ignore
 
+  deploy-security-check:
+    name: Post-Deploy Security Headers & Nonce Rotation
+    needs: build
+    if: github.event_name == 'push' && vars.PREVIEW_URL != ''
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: ${{ vars.PREVIEW_URL }}
+    defaults:
+      run:
+        working-directory: ./frontend
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      - name: Verify Security Headers
+        run: bash scripts/check-security-headers.sh
+
+      - name: Verify CSP Nonce Rotation
+        run: |
+          nonce_of() {
+            curl -sI "$1" | tr -d '\r' | grep -i '^content-security-policy' | grep -o "'nonce-[^']*'" | head -n1
+          }
+          a=$(nonce_of "$BASE_URL/")
+          b=$(nonce_of "$BASE_URL/api/health")
+          c=$(nonce_of "$BASE_URL/")
+          echo "nonces: $a | $b | $c"
+          if [ -z "$a" ]; then echo "No CSP nonce found"; exit 1; fi
+          if [ "$a" = "$c" ]; then echo "Nonce did not rotate between requests"; exit 1; fi
+
   smart-contracts:
     name: Soroban Contract Checks
     needs: secret-scan
