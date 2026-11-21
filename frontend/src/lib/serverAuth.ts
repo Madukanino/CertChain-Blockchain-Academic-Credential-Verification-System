@@ -264,6 +264,47 @@ export function getServiceRoleClient() {
     return createServiceRoleClient();
 }
 
+/**
+ * Verifies a server-to-server observability ingest request.
+ *
+ * Requires a shared secret supplied via the `x-observability-secret` header and
+ * compares it in constant time against the server-only `OBSERVABILITY_INGEST_SECRET`.
+ * Fails closed when the secret is not configured.
+ */
+export function requireObservabilityIngestRequest(
+    request: NextRequest,
+): { ok: true } | { ok: false; status: number; error: string } {
+    const expected = process.env.OBSERVABILITY_INGEST_SECRET;
+    if (!expected) {
+        return {
+            ok: false,
+            status: 500,
+            error: 'Server configuration error',
+        };
+    }
+
+    const provided = request.headers.get('x-observability-secret') ?? '';
+    const encoder = new TextEncoder();
+    const a = encoder.encode(provided);
+    const b = encoder.encode(expected);
+
+    let diff = a.length ^ b.length;
+    const length = Math.max(a.length, b.length);
+    for (let i = 0; i < length; i++) {
+        diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+    }
+
+    if (diff !== 0) {
+        return {
+            ok: false,
+            status: 401,
+            error: 'Invalid observability ingest secret',
+        };
+    }
+
+    return { ok: true };
+}
+
 export function createUserScopedServerClient(accessToken: string) {
     if (!supabaseUrl || !supabaseAnonKey) {
         throw new Error(
