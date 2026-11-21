@@ -24,8 +24,10 @@ export function middleware(request: NextRequest) {
         },
     });
 
-    // Also attach to response headers
+    // Also attach to response headers. Expose the nonce so the deploy check
+    // can assert per-response nonce rotation without parsing the CSP header.
     response.headers.set('x-request-id', requestId);
+    response.headers.set('x-nonce', nonce);
     response.headers.set('Content-Security-Policy', csp);
     return response;
 }

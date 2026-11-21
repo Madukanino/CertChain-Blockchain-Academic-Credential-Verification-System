@@ -16,6 +16,7 @@
         "test:browser": "playwright test",
         "test:a11y": "playwright test tests/playwright/a11y.spec.ts",
         "test:load": "vitest run tests/load-endpoints.test.ts",
+        "test:security-headers": "bash scripts/check-security-headers.sh",
         "lint": "eslint .",
         "format": "prettier --write .",
         "indexer": "tsx --env-file=.env.local scripts/indexer.ts",
