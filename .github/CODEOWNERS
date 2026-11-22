@@ -1,11 +1,11 @@
 # Default owners for all repository content
-* @soumen0818
+* @soumen0818 @blessingsokeke618-sys
 
 # Frontend and related UI ownership
-/frontend/ @soumen0818
+/frontend/ @soumen0818 @blessingsokeke618-sys
 
-# Smart contract ownership
-/contracts/ @soumen0818
+# Smart contract ownership — security-sensitive; two owners required
+/contracts/ @soumen0818 @blessingsokeke618-sys
 
 # GitHub automation and repository governance
-/.github/ @soumen0818
+/.github/ @soumen0818 @blessingsokeke618-sys
