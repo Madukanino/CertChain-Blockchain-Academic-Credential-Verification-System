@@ -1,5 +1,24 @@
 # Security Advisories
 
+## Reporting a Vulnerability
+
+**Please do not open a public GitHub issue for security vulnerabilities.**
+
+To report a security issue, email **security@acredia.app** with:
+
+- A description of the vulnerability and its potential impact.
+- Steps to reproduce or a proof-of-concept (screenshots, logs, or code snippets).
+- Affected versions or components.
+
+**What to expect:**
+
+- Acknowledgement within **48 hours** of your report.
+- A status update within **7 days** as we assess severity and scope.
+- We will coordinate a disclosure date with you once a fix is ready.
+- Credits in the release notes for responsible disclosure (opt-in).
+
+Do not publish details of the vulnerability until we have released a fix and agreed on a disclosure date. If you do not receive a response within 7 days, follow up at the same address referencing your original report.
+
 ## Secrets Management and Rotation
 
 The authoritative runbook for secret storage, testnet/mainnet profile separation,
@@ -36,6 +55,25 @@ Example retention cleanup:
 DELETE FROM public.verification_logs
 WHERE created_at < NOW() - INTERVAL '90 days';
 ```
+
+## Dependency Audit Cadence
+
+**Owner:** maintainers (@blessingsokeke618-sys)
+**Frequency:** monthly, and immediately after any dependency update that bumps a major version.
+**Tool:** `npm audit` (frontend) + `cargo audit` (contracts via `cargo-audit`)
+**Where results are recorded:** Update the audit table below after each run.
+
+To run locally:
+
+```bash
+# Frontend
+cd frontend && npm audit
+
+# Contracts (requires cargo-audit)
+cd contracts && cargo audit
+```
+
+---
 
 ## Dependency Audit — 2026-05-27
 
