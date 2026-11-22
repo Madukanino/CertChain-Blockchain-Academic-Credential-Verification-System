@@ -1156,7 +1156,7 @@ Future metadata fields can be added to stored `metadata` or IPFS display metadat
 - **Student Control**: Students own their credential NFTs
 - **Selective Disclosure**: Share only what's necessary
 - **IPFS Storage**: Decentralized, censorship-resistant
-- **No PII on Blockchain**: Personal data only in IPFS/database
+- **Minimal On-Chain Footprint**: The blockchain stores only credential hashes, token IDs, issuer/student `did:stellar` addresses, and timestamps. Personal data (name, institution, grade details) is stored in IPFS and Supabase only — never as raw plaintext on-chain.
 
 ---
 

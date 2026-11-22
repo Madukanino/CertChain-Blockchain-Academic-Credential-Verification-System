@@ -54,11 +54,18 @@ rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --release
 ```
 
-Run the canonical Supabase scripts for a clean database:
+Run the canonical Supabase schema for a clean database:
 
 ```text
-frontend/sql/database_schema.sql
-frontend/sql/secure_rls_migration.sql
+frontend/supabase/schema.sql
+```
+
+Apply it via the Supabase CLI:
+
+```powershell
+npm run db:schema
+# or
+supabase db push
 ```
 
 ## Production Safety
