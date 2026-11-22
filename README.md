@@ -557,7 +557,7 @@ sequenceDiagram
 
 #### For Students (Viewing Credentials)
 
-1. **Login**: Authenticate with email or wallet
+1. **Login**: Sign in with email and password; optionally connect a Stellar wallet to claim credentials or sign transactions (wallet-signature login via SEP-0010 is a planned roadmap item — see [issue #48](../../issues/48))
 2. **Dashboard**: View all issued credentials from Stellar
 3. **Details**: Click credential to see complete information stored on Stellar blockchain
 4. **Share**: Generate QR code or verification link

@@ -36,3 +36,13 @@ In **Settings → Branches → Branch protection rules** for `main`/`master`:
   in **Settings → Security → Code security and analysis → Dependency graph**.
 - `codeql.yml` runs on push to main and on PRs; it must pass before merge.
 - `secret-scan.yml` runs on every PR; a detected secret blocks merge.
+
+## Settings-applied audit log
+
+| Date | Applied by | Changes |
+|---|---|---|
+| _(pending)_ | repo maintainer | Apply all checks above in Settings → Branches |
+
+Maintainer: after applying the rules, record the date and your GitHub handle in the table
+above and merge this update to main. A test PR that fails a required check confirms the
+rules are live.
