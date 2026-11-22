@@ -61,7 +61,33 @@ jobs:
 
       - name: Enforce Minimum Coverage
         run: |
-          node -e "const fs=require('fs'); const path='coverage/coverage-summary.json'; if(!fs.existsSync(path)){console.error('Coverage summary missing'); process.exit(1);} const summary=JSON.parse(fs.readFileSync(path,'utf8')); const lines=summary.total.lines.pct; const statements=summary.total.statements.pct; const branches=summary.total.branches.pct; const functions=summary.total.functions.pct; console.log('Coverage summary:', { lines, statements, branches, functions }); const threshold=55; if(lines < threshold || statements < threshold || branches < threshold || functions < threshold){ console.error('Coverage below minimum threshold of 55%'); process.exit(1);}"
+          node -e "
+          const fs = require('fs');
+          const path = 'coverage/coverage-summary.json';
+          if (!fs.existsSync(path)) { console.error('Coverage summary missing'); process.exit(1); }
+          const summary = JSON.parse(fs.readFileSync(path, 'utf8'));
+          const { lines, statements, branches, functions } = summary.total;
+          console.log('Global coverage:', { lines: lines.pct, statements: statements.pct, branches: branches.pct, functions: functions.pct });
+          const globalThreshold = 60;
+          let failed = false;
+          for (const [metric, data] of Object.entries({ lines, statements, branches, functions })) {
+            if (data.pct < globalThreshold) {
+              console.error('Global ' + metric + ' coverage ' + data.pct + '% is below ' + globalThreshold + '%');
+              failed = true;
+            }
+          }
+          // Per-module thresholds for security-critical areas.
+          const moduleThresholds = { 'src/app/api/auth': 70, 'src/app/api/verify': 70, 'src/lib/rate-limit': 70, 'src/lib/stellar': 65 };
+          for (const [mod, threshold] of Object.entries(moduleThresholds)) {
+            const key = Object.keys(summary).find(k => k.includes(mod));
+            if (key && summary[key].lines.pct < threshold) {
+              console.error(mod + ' line coverage ' + summary[key].lines.pct + '% is below module threshold of ' + threshold + '%');
+              failed = true;
+            }
+          }
+          if (failed) process.exit(1);
+          console.log('All coverage thresholds met.');
+          "
 
       - name: Upload Coverage Report
         if: always()

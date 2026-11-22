@@ -165,3 +165,42 @@ on-chain hash ties the two together: if the IPFS document changes, the hash won'
 Public sign-up was removed (Issue #239). Acredia provisions institutions, institutions provision
 students, each via single-use invite links. This prevents credential spam and ensures every
 issuer has been vetted by an admin.
+
+---
+
+## Credential Filtering and Search (Phase 2 — issue #98)
+
+The student dashboard and institution view need indexed filtering across potentially
+hundreds of credentials. Supabase's indexing strategy for this feature:
+
+### Filter dimensions
+
+| Dimension | Supabase column | Index type | Notes |
+|---|---|---|---|
+| Institution | `credentials.issuer_id` | btree | foreign key to `institutions.id` |
+| Credential type | `credentials.credential_type` | btree | enum: `degree`, `certificate`, `badge`, `transcript` |
+| Issue date | `credentials.issued_at` | btree | timestamp; supports range queries |
+| Subject / module | `credential_subjects.subject_code` | btree | nullable; linked via join |
+| Revocation status | `credentials.revoked` | partial (WHERE revoked = false) | fast "active only" queries |
+| Full-text | `credentials.fts` | GIN tsvector | over `title` + `description` + `institution_name` |
+
+### Pagination
+
+All filter endpoints return a `cursor`-based page (keyed on `(issued_at DESC, id DESC)`)
+rather than offset pagination, so large result sets don't re-scan the head of the table.
+
+### RLS isolation
+
+Every query is wrapped in an RLS policy that restricts rows to:
+- the requesting student's own credentials (`student_id = auth.uid()`), or
+- the requesting institution's issued credentials (`issuer_id = auth.uid()`), or
+- admin (all rows, subject to audit logging).
+
+No cross-user credential data is reachable through the filter API.
+
+### Empty-filter baseline
+
+A request with no filter params returns the full page for the authenticated user, ordered
+by `issued_at DESC`. The endpoint must not return all rows without a user scope —
+the RLS policy is the last line of defence, but the API layer also asserts `auth.uid()`
+is present before executing the query.

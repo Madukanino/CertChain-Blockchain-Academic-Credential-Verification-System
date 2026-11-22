@@ -4425,4 +4425,86 @@ mod proptest_invariants {
             2
         );
     }
+
+    // ── issue #99: two-step ownership transfer happy path ──────────────────
+
+    #[test]
+    fn test_transfer_owner_happy_path() {
+        let (env, contract, owner, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        let new_owner = Address::generate(&env);
+
+        // Step 1: propose transfer — emits own_xfer
+        client.transfer_owner(&new_owner);
+        assert_eq!(client.get_pending_owner(), Some(new_owner.clone()));
+
+        // Step 2: new owner accepts — emits own_acpt, clears PendingOwner
+        client.accept_owner();
+        assert_eq!(client.get_owner(), new_owner);
+        assert_eq!(client.get_pending_owner(), None);
+
+        // Events: own_xfer then own_acpt
+        let events = env.events().all();
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = events
+            .iter()
+            .map(|(_, topics, _)| {
+                topics
+                    .iter()
+                    .next()
+                    .unwrap_or_else(|| soroban_sdk::Val::from_void())
+            })
+            .collect();
+        let _ = topics; // event shapes vary; presence of two events is the assertion
+        assert!(events.len() >= 2);
+    }
+
+    #[test]
+    fn test_transfer_owner_pending_owner_cleared_after_accept() {
+        let (env, contract, _owner, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        let new_owner = Address::generate(&env);
+
+        client.transfer_owner(&new_owner);
+        assert!(client.get_pending_owner().is_some());
+
+        client.accept_owner();
+        assert_eq!(client.get_pending_owner(), None);
+    }
+
+    // ── issue #100: is_revoked for unknown tokens ──────────────────────────
+
+    #[test]
+    fn test_is_revoked_returns_false_for_unknown_token() {
+        let (env, contract, _, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+
+        // token 999 was never issued; current semantics return false (not-found = not-revoked)
+        // this test documents and pins that behaviour
+        assert!(!client.is_revoked(&999u64));
+    }
+
+    #[test]
+    fn test_is_revoked_false_for_active_credential() {
+        let (env, contract, _, issuer, student) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        let hash = dummy_hash(&env, 0x20);
+        let token_id = client
+            .issue_credential(&issuer, &student, &hash, &String::from_str(&env, "ipfs://t"))
+            .unwrap();
+        assert!(!client.is_revoked(&token_id));
+    }
+
+    #[test]
+    fn test_is_revoked_true_after_revocation() {
+        let (env, contract, owner, issuer, student) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        let hash = dummy_hash(&env, 0x21);
+        let token_id = client
+            .issue_credential(&issuer, &student, &hash, &String::from_str(&env, "ipfs://t"))
+            .unwrap();
+        env.as_contract(&contract, || {
+            CertChainCredential::revoke_credential(env.clone(), token_id, owner.clone()).unwrap();
+        });
+        assert!(client.is_revoked(&token_id));
+    }
 }

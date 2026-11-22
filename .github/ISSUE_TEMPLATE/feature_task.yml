@@ -1,0 +1,62 @@
+name: Feature / Task
+description: Propose a new feature or roadmap task
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for new features, roadmap tasks, or engineering improvements.
+        For bugs, use the **Bug report** template. For documentation issues, use the **Documentation** template.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What problem does this feature solve, or what goal does it achieve?
+      placeholder: "Users cannot currently..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and Proposed Solution
+      description: What should change? List files or modules likely affected.
+      placeholder: |
+        - Add X to `frontend/src/...`
+        - Update `contracts/...` to support Y
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: How do we know this is done?
+      placeholder: |
+        - [ ] Users can...
+        - [ ] CI passes with the new code path covered
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - high
+        - medium
+        - low
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: This is not a security vulnerability (use SECURITY.md for those)
+          required: true

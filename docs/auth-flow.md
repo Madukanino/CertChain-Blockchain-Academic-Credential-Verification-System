@@ -42,16 +42,47 @@ User visits /auth/login
   → Redirect to /dashboard (institution/student) or /admin (admin)
 ```
 
-### Invite Acceptance
+### Invite Acceptance — Two Paths
+
+CertChain uses a two-tier invite model described in [ADR 0003](decisions/0003-multiple-institution-users.md):
+
+**Path A — Admin → POC (institution primary contact)**
 
 ```
-Admin creates institution record
+Admin creates institution record in /admin
   → Supabase generates single-use invite link
   → Link emailed to POC (or copy-pasted from admin dashboard)
   → POC opens /auth/accept-invite?token=<TOKEN>
-  → Sets own password
+  → Sets own password; Supabase creates account with role = 'institution'
   → Session created; redirected to /dashboard
 ```
+
+**Path B — POC → Member (additional institution users)**
+
+```
+POC opens institution settings → "Invite team member"
+  → Backend inserts a pending row in institution_members table
+  → Supabase generates single-use invite link for the member email
+  → Link emailed to the member
+  → Member opens /auth/accept-invite?token=<TOKEN>
+  → Sets own password; Supabase creates account with role = 'institution'
+  → institution_members row is activated; member is associated to that institution
+  → Session created; redirected to /dashboard
+```
+
+Both paths produce a Supabase Auth account with `role = 'institution'`. The member's
+access is scoped to their institution's data via RLS policies on `institution_members`.
+
+### Role Hierarchy within an Institution
+
+| Sub-role | Set in | Permissions |
+|---|---|---|
+| `owner` | First POC on the institution record | Full access, can invite/remove members |
+| `admin` | POC-promoted member | Can issue/revoke credentials, manage students |
+| `member` | Default for Path B invites | Can issue credentials, cannot manage users |
+
+The `roleResolver.ts` reads `institution_members.role` after resolving the top-level
+`profiles.role` to determine which institution-scoped actions are permitted.
 
 ### Password Reset
 
