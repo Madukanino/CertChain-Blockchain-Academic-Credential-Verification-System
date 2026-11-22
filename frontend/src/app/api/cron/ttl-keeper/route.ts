@@ -56,6 +56,10 @@ interface KeeperRunSummary {
     bumpSucceeded: number;
     bumpFailed: number;
     bumpSkipped: number;  // TTL already healthy
+    // Revoked credentials stay in the bump set (Issue #138): their on-chain
+    // entries must outlive the TTL window so verification reports "revoked"
+    // rather than "not found". Counted here so the coverage is observable.
+    revokedTotal: number;
     minRemainingTtlLedgers: number | null;
     keeperBalanceXlm: number | null;
     lowBalance: boolean;
@@ -244,9 +248,12 @@ export async function GET(request: NextRequest) {
     const cursorStart = await readCursor(supabase);
 
     // Fetch a page of credential token IDs, continuing from the cursor.
+    // Revoked credentials are deliberately included (Issue #138): excluding
+    // them lets their entries archive, and verify_credential would then return
+    // "not found" instead of "revoked". bump_credential works on them too.
     let query = supabase
         .from('credentials')
-        .select('token_id')
+        .select('token_id, revoked')
         .order('token_id', { ascending: true })
         .limit(BATCH_LIMIT);
     if (cursorStart != null) {
@@ -259,10 +266,14 @@ export async function GET(request: NextRequest) {
         return NextResponse.json({ success: false, error: 'Failed to read credentials' }, { status: 500 });
     }
 
-    const tokenIds = (rows ?? [])
-        .map((r) => (r as { token_id?: string | number | null }).token_id)
-        .filter((v): v is string | number => v != null)
-        .map((v) => String(v));
+    const revokedTokenIds = new Set<string>();
+    const tokenIds = (rows ?? []).flatMap((row) => {
+        const r = row as { token_id?: string | number | null; revoked?: boolean | null };
+        if (r.token_id == null) return [];
+        const tokenId = String(r.token_id);
+        if (r.revoked === true) revokedTokenIds.add(tokenId);
+        return [tokenId];
+    });
 
     let bumpAttempted = 0;
     let bumpSucceeded = 0;
@@ -329,6 +340,7 @@ export async function GET(request: NextRequest) {
         bumpSucceeded,
         bumpFailed,
         bumpSkipped,
+        revokedTotal: revokedTokenIds.size,
         minRemainingTtlLedgers,
         keeperBalanceXlm,
         lowBalance,
@@ -347,6 +359,7 @@ export async function GET(request: NextRequest) {
         bumpSucceeded,
         bumpFailed,
         bumpSkipped,
+        revokedTotal: summary.revokedTotal,
         minRemainingTtlLedgers,
         lowTtl,
         lowBalance,

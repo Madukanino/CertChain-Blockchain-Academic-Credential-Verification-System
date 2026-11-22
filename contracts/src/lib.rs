@@ -2475,6 +2475,50 @@ mod tests {
         });
     }
 
+    /// A revoked credential must stay in the keeper's bump set: bumping it
+    /// after the first TTL window keeps it verifiable (still revoked) through
+    /// a second window. If revoked records were skipped, this would read as
+    /// "not found" instead of "revoked" (Issue #138).
+    #[test]
+    fn test_revoked_credential_survives_keeper_bump_cycle() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, contract, _, issuer, student) = setup();
+        let hash = dummy_hash(&env, 23);
+
+        let token_id = env.as_contract(&contract, || {
+            CertChainCredential::issue_credential(
+                env.clone(),
+                student,
+                issuer.clone(),
+                hash.clone(),
+                String::from_str(&env, "ipfs://revoked-bump-cycle"),
+            )
+            .unwrap()
+        });
+
+        env.as_contract(&contract, || {
+            CertChainCredential::revoke_credential(env.clone(), token_id, issuer).unwrap();
+        });
+
+        // First keeper run near the end of the issue TTL extends the entry.
+        env.ledger().set_sequence_number(5_000_000);
+        env.as_contract(&contract, || {
+            CertChainCredential::bump_credential(env.clone(), token_id)
+                .expect("revoked credential must remain bumpable");
+        });
+
+        // Advance past the original TTL window; only the bump keeps it alive.
+        env.ledger().set_sequence_number(10_000_000);
+        env.as_contract(&contract, || {
+            let verified = CertChainCredential::verify_credential(env.clone(), hash.clone())
+                .expect("revoked credential must still be verifiable after keeper bump");
+            assert_eq!(verified.token_id, token_id);
+            assert!(verified.revoked, "credential must still read as revoked");
+            assert!(CertChainCredential::is_revoked(env.clone(), token_id));
+        });
+    }
+
     /// bump_credential must succeed and keep the entry alive past a large
     /// simulated ledger advance even when called by an unprivileged party.
     #[test]
