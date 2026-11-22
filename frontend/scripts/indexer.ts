@@ -13,6 +13,18 @@ if (!RPC_URL || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
     process.exit(1);
 }
 
+// Parse --reset-from <ledger> flag for backfill/reset.
+// Usage: npx ts-node indexer.ts --reset-from 1234567
+// Resets the stored cursor to the given ledger so the next run replays from there.
+const resetFromArg = process.argv.indexOf('--reset-from');
+const RESET_FROM_LEDGER: number | null = resetFromArg !== -1
+    ? parseInt(process.argv[resetFromArg + 1] ?? '', 10)
+    : null;
+if (RESET_FROM_LEDGER !== null && (!Number.isInteger(RESET_FROM_LEDGER) || RESET_FROM_LEDGER < 0)) {
+    console.error('--reset-from requires a non-negative integer ledger sequence number');
+    process.exit(1);
+}
+
 // Resolve the credential NFT contract ID through the same helper the app uses
 // so a single env change (NEXT_PUBLIC_CREDENTIAL_NFT_CONTRACT_ID) keeps the
 // indexer and the app pointed at the same contract.
@@ -158,13 +170,29 @@ async function processEvent(event: rpc.Api.EventResponse) {
 async function run() {
     console.log('Starting Acredia off-chain indexer...');
 
+    // Apply --reset-from before the main loop so the first iteration uses the new cursor.
+    if (RESET_FROM_LEDGER !== null) {
+        const startLedgerForReset = RESET_FROM_LEDGER > 0 ? RESET_FROM_LEDGER - 1 : 0;
+        const { error } = await supabase
+            .from('indexer_state')
+            .upsert({ id: 'main', last_ledger: startLedgerForReset });
+        if (error) {
+            console.error('Failed to reset cursor:', error.message);
+            process.exit(1);
+        }
+        console.log(`Cursor reset: will replay from ledger ${RESET_FROM_LEDGER}`);
+    }
+
     while (true) {
         try {
             // Get latest network ledger
             const latestLedgerResponse = await server.getLatestLedger();
             const networkLatestLedger = latestLedgerResponse.sequence;
 
-            // Get last synced ledger
+            // Get last synced ledger from persistent Supabase state.
+            // On a fresh deployment (no row yet) the indexer starts from the current
+            // ledger to avoid replaying the entire chain history. To backfill from an
+            // earlier ledger, restart with: --reset-from <ledger>
             let { data: stateData } = await supabase
                 .from('indexer_state')
                 .select('last_ledger')
