@@ -121,8 +121,12 @@ Acredia is built on **Stellar Network**, a decentralized network focused on prov
 **♻️ Energy Efficient**
 
 - Minimal energy consumption
-- Uses consensus algorithm designed for efficiency
-- Supports sustainable applications
+**Hash version:** the current credential digest format is **v2**, identified by
+`sha256:canonical-json:v2`. Verifiers must recompute the digest using this version and
+compare it to the on-chain hash. Credentials issued under the earlier
+`sha256:canonical-json:v1` format are legacy; to verify one, use the v1 rules.
+See [docs/verifiable-credentials.md](docs/verifiable-credentials.md) for the exact
+canonicalization and verification steps.
 
 ### Network Details
 
