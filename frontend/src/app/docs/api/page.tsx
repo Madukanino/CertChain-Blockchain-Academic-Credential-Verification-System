@@ -87,6 +87,64 @@ export default function ApiDocsPage() {
                         </Card>
                     </section>
 
+                    <section id="batch-verification-api">
+                        <h2 className="text-2xl font-semibold border-b pb-2 mb-6">Batch Verification API</h2>
+                        <p className="text-muted-foreground mb-4">
+                            Verify a cohort of credentials in a single HTTP request. Each token is evaluated independently and returns its own status without aborting the rest of the batch.
+                        </p>
+
+                        <Card className="p-6 overflow-hidden">
+                            <h3 className="text-lg font-medium mb-2">Batch Verify Credentials</h3>
+                            <div className="flex items-center gap-3 bg-secondary/30 p-3 rounded-md mb-4 border font-mono text-sm">
+                                <span className="bg-primary/20 text-primary px-2 py-0.5 rounded text-xs font-bold">POST</span>
+                                <span>/api/verify/batch</span>
+                            </div>
+
+                            <div className="space-y-4 text-sm">
+                                <div>
+                                    <h4 className="font-semibold text-foreground mb-1">Request Body &amp; Limits</h4>
+                                    <p className="text-muted-foreground mb-2">
+                                        Submit between 1 and 20 token IDs per request. Batches exceeding 20 tokens are rejected with <code className="bg-muted px-1 py-0.5 rounded">400 Bad Request</code>. Rate-limit quota is consumed proportionally to batch size (1 unit per token against the verify quota).
+                                    </p>
+                                    <pre className="bg-[#1e1e1e] text-[#d4d4d4] p-4 rounded-md overflow-x-auto text-xs font-mono border">
+{`{
+  "tokens": ["token-valid", "token-revoked", "token-missing"]
+}`}
+                                    </pre>
+                                </div>
+
+                                <div>
+                                    <h4 className="font-semibold text-foreground mb-1">Partial-Failure Semantics</h4>
+                                    <p className="text-muted-foreground">
+                                        A valid batch request returns <code className="bg-muted px-1 py-0.5 rounded">200 OK</code> with a per-token <code className="bg-muted px-1 py-0.5 rounded">results</code> array preserving input order. Individual failures never fail the entire batch: inspect each item&apos;s <code className="bg-muted px-1 py-0.5 rounded">status</code> (<code className="bg-muted px-1 py-0.5 rounded">verified</code>, <code className="bg-muted px-1 py-0.5 rounded">revoked</code>, <code className="bg-muted px-1 py-0.5 rounded">mismatch</code>, <code className="bg-muted px-1 py-0.5 rounded">not_found</code>, <code className="bg-muted px-1 py-0.5 rounded">invalid</code>, <code className="bg-muted px-1 py-0.5 rounded">unavailable</code>, or <code className="bg-muted px-1 py-0.5 rounded">error</code>) and <code className="bg-muted px-1 py-0.5 rounded">statusCode</code>.
+                                    </p>
+                                </div>
+
+                                <div>
+                                    <h4 className="font-semibold text-foreground mb-1">Response (200 OK)</h4>
+                                    <pre className="bg-[#1e1e1e] text-[#d4d4d4] p-4 rounded-md overflow-x-auto text-xs font-mono border mt-2">
+{`{
+  "success": true,
+  "total": 3,
+  "summary": {
+    "verified": 1,
+    "revoked": 1,
+    "mismatch": 0,
+    "notFound": 1,
+    "failed": 0
+  },
+  "results": [
+    { "token": "token-valid", "success": true, "status": "verified", "statusCode": 200, "credential": { ... }, "verification": { "verified": true, "revoked": false, ... } },
+    { "token": "token-revoked", "success": true, "status": "revoked", "statusCode": 200, "credential": { ... }, "verification": { "verified": false, "revoked": true, ... } },
+    { "token": "token-missing", "success": false, "status": "not_found", "statusCode": 404, "error": "Credential not found" }
+  ]
+}`}
+                                    </pre>
+                                </div>
+                            </div>
+                        </Card>
+                    </section>
+
                     <section id="upgrade-policy">
                         <h2 className="text-2xl font-semibold border-b pb-2 mb-6">Contract Upgrade Policy</h2>
                         <p className="text-muted-foreground mb-4">
