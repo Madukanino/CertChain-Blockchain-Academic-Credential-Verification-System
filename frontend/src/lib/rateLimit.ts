@@ -39,6 +39,11 @@ type RateLimitOptions = {
      * be able to sidestep its quota by rotating source addresses.
      */
     identifier?: string;
+    /**
+     * Number of quota units to consume for this request (defaults to 1).
+     * Used by batch endpoints to charge proportionally to batch size.
+     */
+    cost?: number;
 };
 
 type RateLimitResult = {
@@ -50,7 +55,7 @@ type RateLimitResult = {
 export type RateLimitBucket = { count: number; resetAt: number };
 
 export type RateLimitStore = {
-    increment: (key: string, windowSeconds: number) => Promise<{ count: number; resetAt: number }>;
+    increment: (key: string, windowSeconds: number, cost?: number) => Promise<{ count: number; resetAt: number }>;
     reset?: () => void;
 };
 
@@ -94,7 +99,8 @@ export function createInMemoryRateLimitStore(
     store: Map<string, RateLimitBucket> = new Map(),
 ): RateLimitStore {
     return {
-        async increment(key: string, windowSeconds: number) {
+        async increment(key: string, windowSeconds: number, cost = 1) {
+            const weight = Math.max(1, Math.floor(cost));
             const now = Date.now();
             if (now - lastCleanup > CLEANUP_INTERVAL_MS) {
                 cleanupStaleBuckets(now, store);
@@ -102,12 +108,12 @@ export function createInMemoryRateLimitStore(
 
             const existing = store.get(key);
             if (!existing || existing.resetAt <= now) {
-                const bucket = { count: 1, resetAt: now + windowSeconds * 1000 };
+                const bucket = { count: weight, resetAt: now + windowSeconds * 1000 };
                 store.set(key, bucket);
                 return bucket;
             }
 
-            existing.count += 1;
+            existing.count += weight;
             store.set(key, existing);
             return existing;
         },
@@ -134,7 +140,8 @@ export function createUpstashRateLimitStore(): RateLimitStore | null {
     const fallback = createInMemoryRateLimitStore();
 
     return {
-        async increment(key: string, windowSeconds: number) {
+        async increment(key: string, windowSeconds: number, cost = 1) {
+            const weight = Math.max(1, Math.floor(cost));
             try {
                 const response = await fetch(`${restUrl}/pipeline`, {
                     method: 'POST',
@@ -143,7 +150,7 @@ export function createUpstashRateLimitStore(): RateLimitStore | null {
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify([
-                        ['INCR', key],
+                        weight === 1 ? ['INCR', key] : ['INCRBY', key, weight],
                         ['EXPIRE', key, windowSeconds, 'NX'],
                         ['TTL', key],
                     ]),
@@ -154,7 +161,7 @@ export function createUpstashRateLimitStore(): RateLimitStore | null {
                 }
 
                 const [countResult, , ttlResult] = await response.json() as Array<{ result?: unknown }>;
-                const count = Number(countResult?.result ?? 1);
+                const count = Number(countResult?.result ?? weight);
                 const ttl = Number(ttlResult?.result ?? windowSeconds);
 
                 // Upstash is reachable — mark limiter as distributed.
@@ -171,7 +178,7 @@ export function createUpstashRateLimitStore(): RateLimitStore | null {
                 // Mark as fallback so health checks and admin console can surface this.
                 currentMode = 'in-memory-fallback';
                 captureException(err, { context: 'rateLimit.increment', fallback: 'in-memory' });
-                return fallback.increment(key, windowSeconds);
+                return fallback.increment(key, windowSeconds, weight);
             }
         },
         // Flush all rate-limit keys in the configured Upstash database.
@@ -323,13 +330,13 @@ export const setRateLimitStoreForTests = (store: RateLimitStore) => {
 
 export const checkRateLimit = async (
     request: Request,
-    { windowSeconds, maxRequests, prefix = 'api', identifier }: RateLimitOptions,
+    { windowSeconds, maxRequests, prefix = 'api', identifier, cost }: RateLimitOptions,
 ): Promise<RateLimitResult> => {
     const effectiveWindowSeconds = readEnvOverride(prefix, 'WINDOW_SECONDS') ?? windowSeconds;
     const effectiveMaxRequests = readEnvOverride(prefix, 'MAX_REQUESTS') ?? maxRequests;
     const subject = identifier?.trim() || getClientIp(request);
     const key = `${prefix}:${subject}`;
-    const bucket = await activeStore.increment(key, effectiveWindowSeconds);
+    const bucket = cost !== undefined ? await activeStore.increment(key, effectiveWindowSeconds, cost) : await activeStore.increment(key, effectiveWindowSeconds);
 
     if (bucket.count > effectiveMaxRequests) {
         return {
